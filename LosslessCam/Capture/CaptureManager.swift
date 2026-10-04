@@ -617,9 +617,10 @@ final class CaptureManager: NSObject, ObservableObject {
         }
         // The configuration counts as stable once it has run for a few seconds without a runtime error.
         sessionQueue.asyncAfter(deadline: .now() + 4.0) { [weak self] in
-            guard let self = self, self.configGeneration == gen else { return }
-            if self.session.isRunning && self.runtimeErrorsSinceCommit == 0 {
-                UserDefaults.standard.set(false, forKey: Self.inFlightKey)
+            guard let self = self, self.configGeneration == gen, self.runtimeErrorsSinceCommit == 0 else { return }
+            // Survived the configuration: a later crash must not be blamed on camera setup.
+            UserDefaults.standard.set(false, forKey: Self.inFlightKey)
+            if self.session.isRunning {
                 self.workingFallbacks[Self.signature(self.currentSettings)] = self.currentFallbacks
                 self.diagnostics.log("capture", "Configuration stable (fallbacks: \(self.currentFallbacks.summary))")
             }
