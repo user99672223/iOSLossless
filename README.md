@@ -29,9 +29,10 @@ runner for sideloading and attaches it to GitHub Releases on `v*` tags.
 8. [Getting files off the device](#getting-files-off-the-device)
 9. [Building and sideloading](#building-and-sideloading)
 10. [Repository layout](#repository-layout)
-11. [Known limitations](#known-limitations)
-12. [Deviations](#deviations)
-13. [Licensing](#licensing)
+11. [Troubleshooting](#troubleshooting)
+12. [Known limitations](#known-limitations)
+13. [Deviations](#deviations)
+14. [Licensing](#licensing)
 
 ---
 
@@ -57,8 +58,14 @@ runner for sideloading and attaches it to GitHub Releases on `v*` tags.
   running hash over the audio stream, compared against the decoded MKV.
   PASS/FAIL badge per recording with the first mismatching frame index, FFV1
   slice-CRC status from the decoder, manual re-verification.
-* **Library**: thumbnails, resolution, fps, duration, size, codecs,
-  verification badge, paired HEVC reference indicator, full metadata, delete.
+* **Library**: thumbnails, resolution, fps, timeline duration and frame count,
+  size, codecs, dropped-frame badge, verification badge, paired HEVC reference
+  indicator, full metadata, delete. Recordings interrupted by a crash are
+  adopted automatically (see [Interrupted recordings](#interrupted-recordings)).
+* **Diagnostics** (Settings → Diagnostics): a persistent log of session
+  errors with their AVFoundation error codes, caught exceptions, recovery
+  steps and per-recording summaries, viewable, copyable and shareable; stored
+  only on the device.
 * **Player**: FFV1 decode through libavcodec on a background thread, HDR display
   through a Metal/EDR pipeline (HLG BT.2100 layer), FLAC audio through
   AVAudioEngine (4-channel ambisonic content is rendered as a stereo decode and
@@ -121,13 +128,24 @@ AVCaptureSession (inputPriority, device format chosen from AVCaptureDevice.forma
  ├─ AVCaptureAudioDataOutput  PCM → int32 (24-bit top-aligned) ─▶ .lci / FLAC
  └─ AVCaptureMovieFileOutput  HEVC Dolby Vision/HLG reference  ─▶ _HEVC.mov   (or AVAssetWriter fallback)
 
-after stop (two-stage): Stage 2 = .lci ─▶ FFV1 v3 + FLAC ─▶ .mkv, progress UI, then .lci is deleted
+after stop (two-stage): Stage 2 = .lci ─▶ FFV1 v3 + FLAC ─▶ .mkv, progress UI
 then: verification = decode .mkv, rehash, compare with .lchash → PASS / FAIL
+      the .lci intermediate is deleted only after a PASS
 ```
 
 * **Never silent**: frames rejected by a full ring buffer and frames dropped
   by AVFoundation are counted separately, shown live and stored in the
-  recording's metadata.
+  recording's metadata. While frames are being dropped a full-width warning
+  shows the share kept; after the take a summary states kept/delivered frames,
+  the timeline and the throughput the pipeline sustained. A storage failure
+  (e.g. full flash) stops the recording with a message instead of discarding
+  frames unnoticed.
+* **Timeline with gaps**: every kept frame keeps its AVFoundation timestamp,
+  so a take whose storage path could not keep up still spans its **real
+  duration**, with gaps where frames are missing. The Library shows the
+  timeline and the number of frames (and, when they differ, the footage
+  length = frames ÷ fps and the share of frames kept); the players hold the
+  last frame across a gap and the audio track stays continuous.
 * **Timestamps**: video frames and audio buffers are muxed with their
   AVFoundation presentation timestamps relative to the first video frame.
   Matroska's fixed 1 ms timestamp scale (libavformat) rounds each time stamp
@@ -135,17 +153,55 @@ then: verification = decode .mkv, rehash, compare with .lchash → PASS / FAIL
   in the `.lchash` sidecar. Audio that precedes the first video frame is
   trimmed at sample granularity (counted), gaps > 2 ms are filled with digital
   silence (counted as discontinuities) so A/V sync is preserved.
-* **Memory**: the ring buffer takes ~55 % of the memory the kernel reports as
-  available (`os_proc_available_memory`), capped at 600 frames; a memory
-  warning halves it. At 4K60 10-bit a frame is 24.9 MB, so a few GB of RAM
-  buys a few seconds of burst absorption — it smooths jitter, it cannot fix a
-  sustained deficit (which then shows up as counted drops).
+* **Memory**: the ring buffer takes ~45 % of the memory the kernel reports as
+  available (`os_proc_available_memory`), at most 3 GB / 480 frames; each
+  memory warning trims a quarter of its capacity (never below 8 frames) and
+  returns the freed pool buffers to the system. A frame's buffer is released
+  the moment its worker has written it. At 4K60 10-bit a frame is 24.9 MB, so
+  the buffer absorbs bursts of a few seconds — it smooths jitter, it cannot fix
+  a sustained deficit (which then shows up as counted drops).
 * **Thermals**: `ProcessInfo.thermalState` is part of the telemetry; the app
   does not throttle on its own.
-* **Stage 2 in the background**: iOS grants ~30 s of background time; keep the
-  app in the foreground for stage 2 and verification. Interrupted stage-2 jobs
-  resume on the next launch from the intact intermediate file (the `.lci`
-  container has a trailer index and is scan-recoverable without it).
+* **Stage 2 and recording do not compete**: stage-2 transcodes and
+  verifications of earlier takes pause while a recording is in progress and
+  continue when it stops. The stage-1 workers write their chunks with
+  positional writes, so no worker waits for another's 15–25 MB write.
+* **Stage 2 in the background**: iOS grants ~30 s of background time. When it
+  runs out the job stops cleanly at a frame boundary and continues as soon as
+  the app is active again (the `.lci` container has a trailer index and is
+  scan-recoverable without it; stage 2 can be re-run any number of times).
+
+### Session recovery and safe mode
+
+AVFoundation rejects an impossible configuration either by raising an
+Objective-C exception (which would terminate a Swift app) or by posting a
+runtime error ("Cannot Record") after the session starts. LosslessCam handles
+both:
+
+1. Every configuration setter runs inside an Objective-C exception boundary.
+   A rejected multichannel audio mode falls back FOA → stereo → device
+   default; a format whose frame duration or colour space is rejected is
+   skipped for the next best one; white-balance conversions are range-checked.
+2. A runtime error shortly after a configuration change walks a recovery
+   ladder: first the HEVC reference moves from `AVCaptureMovieFileOutput` to
+   the `AVAssetWriter` path (same stabilized frames, so stabilization is kept),
+   then stabilization is turned off, then the audio mode is reduced. Each step
+   is shown in the UI and logged with the AVFoundation error domain, code and
+   underlying error. A configuration that worked is remembered for the session.
+3. If the app ever terminates while configuring the camera, the next launch
+   starts in **safe mode** (level 1: no multichannel audio mode and no
+   MovieFileOutput; level 2: also no stabilization; level 3: also no
+   microphone). Safe mode is shown on the Capture screen and can be left from
+   Settings.
+
+### Interrupted recordings
+
+If the app is terminated during a recording (crash, jetsam, battery), the
+Library adopts what reached the flash: a two-stage `.lci` intermediate becomes
+a pending recording and stage 2 builds the MKV from it; an unfinalised
+real-time `.mkv` (no Cues, no duration) gets its frame index rebuilt by
+scanning. The capture hash list is flushed every 64 frames, so verification
+checks every frame that has a hash and reports the few at the end that do not.
 
 ---
 
@@ -187,10 +243,14 @@ pipeline applies the HLG system gamma and EDR headroom. SDR recordings use a
 BT.709 layer.
 
 * **Single player**: libavcodec FFV1 decode (slice threads) on a dedicated
-  thread. Two pacing modes: *every frame* (plays as fast as decode allows,
-  slow-motion if 4K60 cannot be decoded in real time — frame stepping and
-  scrubbing stay exact, the UI stays responsive) and *real time* (follows the
-  audio clock, skips frames when decode is slow). Decode fps/ms are shown.
+  thread. Playback is paced by **presentation timestamps**, so gaps left by
+  dropped frames are held and the audio stays in sync. Three pacing modes:
+  *every frame* (each frame at its timestamp, slow-motion if 4K60 cannot be
+  decoded in real time — frame stepping and scrubbing stay exact), *real time*
+  (follows the audio clock, skips frames when decode is slow) and *compact*
+  (frames back to back, gaps collapsed). The overlay shows frame index,
+  timestamp / timeline length, the length of the gap after the current frame,
+  decode fps/ms; it hides itself during playback and can be switched off.
   Two-finger hold shows the 10-bit codes under the finger.
 * **Comparison player**: A drives the timeline; B is matched by presentation
   time plus an offset (`Auto-align` searches ±6 frames for the best PSNR). The
@@ -206,16 +266,16 @@ BT.709 layer.
 | Setting | Options | Notes |
 |---|---|---|
 | Resolution | 1080p / 4K | Greyed out and marked "(not offered)" when the camera has no matching format for the current fps/HDR choice (the closest supported format is then used and a warning is shown). |
-| Frame rate | 24 / 30 / 60 | Sets `activeVideoMin/MaxFrameDuration`. |
-| Stabilization | off / standard / cinematic | Applied on the data-output connection (and the reference's connection). Stabilization happens in the ISP before delivery; the stored frames are the stabilized ones. |
+| Frame rate | 24 / 30 / 60 | Sets `activeVideoMin/MaxFrameDuration` to a value inside the chosen format's supported range; if the format cannot do the requested rate, its highest rate is used and shown. |
+| Stabilization | off / standard / cinematic | Applied on the data-output connection (and the reference's connection). Stabilization happens in the ISP before delivery; the stored frames are the stabilized ones. If the session reports a runtime error with stabilization on, the recovery ladder first moves the reference to AVAssetWriter and only then turns stabilization off; the active state is shown in the format line. |
 | HDR video | on / off | On = 10-bit 'x420' format with `activeColorSpace = .HLG_BT2020`. Off = the camera's 8-bit 4:2:0 SDR format (stored losslessly as yuv420p, BT.709). |
 | Exposure | auto / locked (shutter + ISO sliders) | `setExposureModeCustom`, clamped to the format's limits. |
 | White balance | auto / locked (temperature + tint) | Converted to device gains and clamped to `maxWhiteBalanceGain`. |
 | Focus | continuous / locked lens position | `setFocusModeLocked(lensPosition:)`. |
 | Audio | spatial / stereo | Spatial = `.firstOrderAmbisonics` (4 ch) when supported by the device, otherwise stereo; the active mode is shown. |
 | Capture mode | two-stage / real-time FFV1 | See pipeline. |
-| Stage-1 codec | auto (benchmark pick) or explicit | UT Video is listed but marked unsupported for 10-bit input. |
-| HEVC reference | auto / MovieFileOutput / AssetWriter / off | Auto prefers MovieFileOutput and falls back when the session rejects it. |
+| Stage-1 codec | auto (benchmark pick) or explicit | The automatic pick uses benchmark results measured at the bit depth being recorded. UT Video is listed but marked unsupported for 10-bit input; a codec that cannot take the bit depth falls back to LZ4 + shuffle. |
+| HEVC reference | auto / MovieFileOutput / AssetWriter / off | Auto prefers MovieFileOutput and falls back to AssetWriter when the session rejects it or reports a runtime error. |
 | Presets | **Fancy**: cinematic stabilization, HDR on, exposure/WB/focus auto. **Neutral**: stabilization off, HDR off, exposure/WB/focus locked at the current values. | Presets only set the toggles. |
 
 ---
@@ -240,7 +300,7 @@ every lossless codec):
 | Codec | Ratio on camera content | Final file at 4K60 10-bit |
 |---|---|---|
 | FFV1 v3 (final) | ≈ 1.8–2.5× | ≈ 35–50 GB per minute |
-| LZ4 + shuffle (stage 1) | ≈ 1.3–1.6× | intermediate, deleted after stage 2 |
+| LZ4 + shuffle (stage 1) | ≈ 1.3–1.6× | intermediate, deleted after the MKV verifies |
 | LZ4 (stage 1) | ≈ 1.1–1.3× | — |
 | Raw planes (stage 1) | 1.0× | — |
 | FLAC 24-bit 4 ch 48 kHz | ≈ 1.5–2× | ≈ 200–300 MB per hour |
@@ -270,8 +330,10 @@ All files live in the app's Documents directory (`UIFileSharingEnabled` and
 * Each recording consists of
   `LosslessCam_<timestamp>_<preset>_<mode>.mkv` (final lossless file),
   `…_HEVC.mov` (Apple's reference, same base name), `….lchash` (hash list),
-  `….json` (metadata, telemetry, verification) and, until stage 2 finishes,
-  `….lci` (intermediate).
+  `….json` (metadata, telemetry, verification) and, until the MKV has
+  verified, `….lci` (intermediate).
+* `LosslessCam_diagnostics.log` is the diagnostics log (also viewable in
+  Settings → Diagnostics).
 
 Playing the MKV elsewhere: `mpv`, VLC and `ffplay` play FFV1/FLAC/MKV with
 correct HLG interpretation; `ffprobe -show_streams` shows
@@ -287,7 +349,8 @@ correct HLG interpretation; `ffprobe -show_streams` shows
 `.github/workflows/build-ipa.yml` runs on every push, on manual dispatch and
 on `v*` tags:
 
-1. `macos-15` runner, newest Xcode present on the image.
+1. `macos-15` runner, newest release (non-beta) Xcode present on the image;
+   the job runs only after the bridge tests pass.
 2. `brew install xcodegen` and `xcodegen generate` (the `.xcodeproj` is
    generated from `project.yml`; it is not committed).
 3. `scripts/build-ffmpeg.sh`: clones FFmpeg at the pinned tag (`n7.1.5`,
@@ -303,8 +366,12 @@ on `v*` tags:
    uploaded as a workflow artifact (`LosslessCam.ipa`) and attached to the
    GitHub Release when a tag was pushed.
 
-A second job builds FFmpeg natively on Ubuntu and runs the C bridge test
-suite (`scripts/test/run-bridge-tests.sh`).
+A first job builds FFmpeg natively on Ubuntu and runs the C bridge test
+suite (`scripts/test/run-bridge-tests.sh`) twice, the second time under
+AddressSanitizer and UndefinedBehaviorSanitizer. It covers every stage-1
+codec, stage 2 (including repeated, cancelled and paused runs), the real-time
+writer, verification and tamper detection, dropped-frame gaps, recovery of an
+unfinalised file and of an intermediate, and audio conversion edge cases.
 
 ### Local build
 
@@ -339,14 +406,16 @@ launch. The app needs iOS 18 and an arm64 device with a camera.
 ```
 LosslessCam/            Swift + SwiftUI app
   App/                  entry point, root tab view
-  Capture/              AVCaptureSession management, format catalogue, HEVC reference recorder
+  Capture/              AVCaptureSession management, recovery ladder, format catalogue, HEVC reference recorder
+  Diagnostics/          persistent diagnostics log
   Pipeline/             ring buffer, recording pipeline, stage-2/verification runner, benchmark, telemetry
   Library/              Documents scanning, sidecar metadata, thumbnails
   Player/               frame sources (FFV1 via libavcodec, HEVC via AVAssetReader), Metal HDR renderer, audio, models
   Views/                Capture, Settings, Benchmark, Library, Player, Comparison screens
   Assets.xcassets, Info.plist, bridging header
 LosslessBridge/         C bridge (static library target): FFmpeg calls, hashing, repacking,
-                        .lci intermediate container, stage-2 transcoder, verifier, PSNR/SSIM
+                        .lci intermediate container, stage-2 transcoder, verifier, PSNR/SSIM,
+                        and the Objective-C exception boundary used around AVFoundation setters
 ThirdParty/xxhash/      vendored xxHash (BSD-2)
 ThirdParty/ffmpeg/      build output of scripts/build-ffmpeg.sh (not committed, cached in CI)
 scripts/build-ffmpeg.sh reproducible FFmpeg build (iOS cross-compile or host build for tests)
@@ -355,6 +424,34 @@ project.yml             XcodeGen project definition (app + bridge targets)
 .github/workflows/      CI: bridge tests on Linux, unsigned IPA on macOS, release attachment
 LICENSE                 MIT for this code; FFmpeg LGPL-2.1+ and xxHash BSD-2 notices
 ```
+
+---
+
+## Troubleshooting
+
+* **A performance panel (OS, GPU, CPU figures) appears over the video.** That
+  is iOS's Metal performance HUD, not part of the app. It is switched on in
+  Settings → Developer → Graphics HUD (the Developer menu exists because
+  Developer Mode is enabled for sideloading). Turn it off there. The app also
+  sets `MetalHudEnabled = NO` in its Info.plist.
+* **The app closed itself when the camera was set up.** Open it again: the
+  crash-loop guard starts it in safe mode, and Settings → Diagnostics shows
+  which step failed. Share the log (Diagnostics → ⋯ → Share log file) when
+  reporting the problem, then try *Leave safe mode* in Settings.
+* **"Camera session error … Cannot Record".** The message now carries the
+  AVFoundation error code and the step the recovery ladder took (for example
+  "MovieFileOutput removed; HEVC reference now encoded by AVAssetWriter").
+  The session keeps running with the relaxed configuration.
+* **The lossless file is shorter than the HEVC reference.** It is not: both
+  span the same timeline. When the storage path cannot sustain the mode, the
+  lossless file has gaps (dropped frames, counted and shown during and after
+  the take) while Apple's lossy encoder keeps every frame. The Library row
+  shows the timeline, the frame count and the share of frames kept. To keep
+  every frame, run the stage-1 benchmark, use a lower frame rate or 1080p,
+  free flash space, and let earlier stage-2 jobs finish (they pause while
+  recording, but still use flash bandwidth).
+* **Stage 2 stopped when I left the app.** iOS allows only a short background
+  time. The job continues automatically when the app is open again.
 
 ---
 
@@ -371,17 +468,27 @@ LICENSE                 MIT for this code; FFmpeg LGPL-2.1+ and xxHash BSD-2 not
   is HLG BT.2020.
 * **1 ms timestamp granularity in Matroska** (libavformat writes a fixed
   TimestampScale); exact nanosecond PTS are in the `.lchash` sidecar.
-* **4K60 FFV1 playback is not real time** on device; the player is decode-paced
-  by default and remains frame-exact.
+* **4K60 FFV1 playback is not real time** on device; the default pacing shows
+  every frame at its timestamp and slows down when decode cannot keep up, and
+  remains frame-exact.
 * **Audio bit depth**: the microphone path delivers 16-bit or 32-bit float PCM
   depending on iOS and the audio mode; see Deviations for how this maps to
   24-bit FLAC.
-* **Simultaneous MovieFileOutput + VideoDataOutput** depends on iOS; when the
-  session rejects the combination the AssetWriter fallback is used and labelled.
+* **Simultaneous MovieFileOutput + VideoDataOutput** depends on iOS, the format
+  and the stabilization mode; when the session rejects the combination or
+  reports a runtime error, the AssetWriter fallback is used and labelled.
+* **AVAssetWriter reference audio** is a stereo AAC monitor track; with spatial
+  (4-channel) capture the fallback reference has no audio (the lossless file
+  keeps all four channels).
+* **The end of an interrupted recording** (about 0.1 s held in the muxer's
+  queue, plus frames still in the RAM ring buffer) is lost when the app is
+  terminated mid-take.
 * **Storage**: 4K60 lossless is ~40–50 GB per minute after FFV1; the app shows
   remaining time at the current write rate. iOS may purge the app's Documents
   only through the Files app or app deletion — move files off regularly.
-* **Background**: stage 2 and verification need the app in the foreground.
+* **Background**: stage 2 and verification need the app in the foreground;
+  they stop cleanly when background time runs out and resume when the app is
+  active.
 * **File-size limits**: none in Matroska; the Files app and USB transfer handle
   >4 GB files.
 
