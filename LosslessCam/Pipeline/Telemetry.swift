@@ -5,11 +5,16 @@ struct Telemetry: Equatable {
     var isRecording = false
     var elapsedSeconds: Double = 0
     var framesIngested: Int64 = 0
+    var framesAccepted: Int64 = 0         // accepted into the ring buffer (written or still queued)
     var framesWritten: Int64 = 0
     var droppedFrames: Int64 = 0          // rejected by the ring buffer (pipeline too slow)
     var sourceDroppedFrames: Int64 = 0    // dropped by AVFoundation before delivery
     var achievedFps: Double = 0           // frames written per second (recent window)
     var ingestFps: Double = 0             // frames delivered per second (recent window)
+    var recentDropFraction: Double = 0    // share of delivered frames dropped over the last ~2 s (0...1)
+    var keptFraction: Double = 1          // accepted / delivered since the start (0...1)
+    var timelineSeconds: Double = 0       // first kept frame → last kept frame (real time)
+    var contentSeconds: Double = 0        // accepted frames / fps
     var bufferFill: Double = 0            // 0...1
     var bufferCount: Int = 0
     var bufferCapacity: Int = 0
@@ -29,6 +34,7 @@ struct Telemetry: Equatable {
     var workerCount: Int = 0
     var stage1Codec: String = ""
     var notes: [String] = []
+    var failure: String?
 
     var thermalLabel: String {
         switch thermalState {

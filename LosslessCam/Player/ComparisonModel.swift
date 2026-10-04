@@ -6,6 +6,8 @@ import Combine
 /// Two-source comparison: A (usually the lossless MKV) drives the timeline; B
 /// (the HEVC reference or another recording) is matched by presentation time
 /// plus a user/auto offset. Luma PSNR/SSIM per frame with running averages.
+/// Playback is paced by A's timestamps, so gaps left by dropped frames are held
+/// (B keeps advancing through the gap when stepped by time).
 final class ComparisonModel: ObservableObject {
     struct Metrics: Equatable {
         var psnr: Double = 0
@@ -41,7 +43,7 @@ final class ComparisonModel: ObservableObject {
     private let b: FrameSource
     private let queueA = DispatchQueue(label: "com.losslesscam.decodeA", qos: .userInteractive)
     private let queueB = DispatchQueue(label: "com.losslesscam.decodeB", qos: .userInteractive)
-    private let metricsQueue = DispatchQueue(label: "com.losslesscam.metrics", qos: .utility)
+    private let alignQueue = DispatchQueue(label: "com.losslesscam.align", qos: .userInitiated)
     private var frameA: DecodedFrame?
     private var frameB: DecodedFrame?
     private let lock = NSLock()
@@ -50,6 +52,8 @@ final class ComparisonModel: ObservableObject {
     private var ssimSum: Double = 0
     private var measured = 0
     private var fpsEMA: Double = 0
+    private var pendingSeek: Int64?
+    private var seekInFlight = false
 
     /// Opens both decoders off the main thread, then builds the model (which owns a UIView) on main.
     static func load(urlA: URL, urlB: URL, completion: @escaping (ComparisonModel?) -> Void) {
@@ -86,6 +90,8 @@ final class ComparisonModel: ObservableObject {
         renderView.onInspect = { [weak self] p in self?.inspect(at: p) }
         if infoB.bitDepth != infoA.bitDepth || infoB.width != infoA.width || infoB.height != infoA.height {
             statusText = "B is \(infoB.width)×\(infoB.height) \(infoB.bitDepth)-bit; metrics need identical geometry"
+        } else if infoA.gapCount > 0 {
+            statusText = "A has \(infoA.gapCount) timeline gap\(infoA.gapCount == 1 ? "" : "s") (≈\(infoA.missingFrames) dropped frames); B is matched by timestamp"
         }
         seek(to: 0)
     }
@@ -107,28 +113,58 @@ final class ComparisonModel: ObservableObject {
     func play() {
         guard !isPlaying else { return }
         isPlaying = true
-        playToken += 1
-        let token = playToken
+        lock.lock(); playToken += 1; let token = playToken; lock.unlock()
         let start = currentIndex >= frameCount - 1 ? 0 : currentIndex
         queueA.async { [self] in self.playLoop(token: token, start: start) }
     }
 
     func pause() {
         isPlaying = false
-        playToken += 1
+        lock.lock(); playToken += 1; lock.unlock()
     }
 
+    private func isCurrent(_ token: Int) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        return playToken == token
+    }
+
+    /// Sleeps in short slices so pause/seek take effect at once even across long timeline gaps.
+    private func waitUntil(_ due: Double, token: Int) -> Bool {
+        while true {
+            if !isCurrent(token) { return false }
+            let remaining = due - CACurrentMediaTime()
+            if remaining <= 0 { return true }
+            Thread.sleep(forTimeInterval: min(remaining, 0.02))
+        }
+    }
+
+    /// Coalesced: only the latest pending target is decoded while a slider drag floods requests.
     func seek(to index: Int64) {
         if isPlaying { pause() }
         let idx = min(max(index, 0), frameCount - 1)
-        queueA.async { [self] in self.decodePair(idx, withMetrics: true) }
+        lock.lock()
+        pendingSeek = idx
+        if seekInFlight { lock.unlock(); return }
+        seekInFlight = true
+        lock.unlock()
+        queueA.async { [self] in
+            while true {
+                self.lock.lock()
+                guard let target = self.pendingSeek else { self.seekInFlight = false; self.lock.unlock(); return }
+                self.pendingSeek = nil
+                self.lock.unlock()
+                _ = self.decodePair(target, withMetrics: true)
+            }
+        }
     }
 
     func step(_ delta: Int64) { seek(to: currentIndex + delta) }
 
     private final class FrameBox: @unchecked Sendable { var frame: DecodedFrame? }
 
-    private func decodePair(_ idx: Int64, withMetrics: Bool) {
+    /// Decodes A[idx] and the time-matched B frame, presents both and (optionally) measures them.
+    @discardableResult
+    private func decodePair(_ idx: Int64, withMetrics: Bool) -> DecodedFrame? {
         let t0 = CACurrentMediaTime()
         let ib = indexB(forA: idx)
         let box = FrameBox()
@@ -142,7 +178,7 @@ final class ComparisonModel: ObservableObject {
         let dt = CACurrentMediaTime() - t0
         let inst = dt > 0 ? 1 / dt : 0
         fpsEMA = fpsEMA == 0 ? inst : fpsEMA * 0.9 + inst * 0.1
-        guard let fa = fa else { return }
+        guard let fa = fa else { return nil }
         lock.lock(); frameA = fa; frameB = fb; lock.unlock()
         renderView.present(frameA: fa.pixelBuffer, frameB: fb?.pixelBuffer)
         let fps = fpsEMA
@@ -153,19 +189,24 @@ final class ComparisonModel: ObservableObject {
             self.decodeFps = fps
         }
         if withMetrics, let fb = fb { computeMetrics(fa, fb) }
+        return fa
     }
 
     private func playLoop(token: Int, start: Int64) {
-        let fps = infoA.fps > 0 ? infoA.fps : 30
         let startWall = CACurrentMediaTime()
+        let startPts = a.pts(ofFrame: start)
         var idx = start
-        while playToken == token && isPlaying {
+        while isCurrent(token) {
             if idx >= frameCount { DispatchQueue.main.async { self.isPlaying = false }; break }
-            decodePair(idx, withMetrics: true)
-            let due = startWall + Double(idx - start + 1) / (fps * speed)
-            let now = CACurrentMediaTime()
-            if due > now { Thread.sleep(forTimeInterval: due - now) }
-            idx += 1
+            guard let fa = decodePair(idx, withMetrics: true) else {
+                DispatchQueue.main.async { self.isPlaying = false }
+                break
+            }
+            // Pace by A's own timestamps so dropped-frame gaps are held, not collapsed.
+            let next = fa.index + 1
+            let nextPts = next < frameCount ? a.pts(ofFrame: next) : fa.ptsNs + infoA.frameDurationNs
+            if !waitUntil(startWall + Double(nextPts - startPts) / 1e9 / speed, token: token) { break }
+            idx = next
         }
     }
 
@@ -210,12 +251,14 @@ final class ComparisonModel: ObservableObject {
     }
 
     /// Searches offsets of ±range frames around the current position for the best PSNR.
+    /// Playback is paused first so the search does not queue behind the play loop.
     func autoAlign(range: Int64 = 6) {
         guard !aligning else { return }
+        pause()
         aligning = true
         let idx = currentIndex
         let base = offsetFrames
-        queueA.async { [self] in
+        alignQueue.async { [self] in
             guard let fa = self.a.frame(at: idx) else { DispatchQueue.main.async { self.aligning = false }; return }
             var best: (offset: Int64, psnr: Double) = (base, -1)
             let pts = self.a.pts(ofFrame: idx)
@@ -226,7 +269,8 @@ final class ComparisonModel: ObservableObject {
                 var m = LCLumaMetrics()
                 CVPixelBufferLockBaseAddress(fa.pixelBuffer, .readOnly); CVPixelBufferLockBaseAddress(fb.pixelBuffer, .readOnly)
                 if let ya = CVPixelBufferGetBaseAddressOfPlane(fa.pixelBuffer, 0), let yb = CVPixelBufferGetBaseAddressOfPlane(fb.pixelBuffer, 0),
-                   CVPixelBufferGetWidth(fa.pixelBuffer) == CVPixelBufferGetWidth(fb.pixelBuffer) {
+                   CVPixelBufferGetWidth(fa.pixelBuffer) == CVPixelBufferGetWidth(fb.pixelBuffer),
+                   CVPixelBufferGetPixelFormatType(fa.pixelBuffer) == CVPixelBufferGetPixelFormatType(fb.pixelBuffer) {
                     let bps = self.infoA.bitDepth == 10 ? 2 : 1
                     _ = lc_luma_metrics(ya.assumingMemoryBound(to: UInt8.self), CVPixelBufferGetBytesPerRowOfPlane(fa.pixelBuffer, 0),
                                         yb.assumingMemoryBound(to: UInt8.self), CVPixelBufferGetBytesPerRowOfPlane(fb.pixelBuffer, 0),

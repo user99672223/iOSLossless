@@ -1,6 +1,12 @@
 import Foundation
 
 /// Sidecar metadata stored next to each recording as `<base>.json`.
+///
+/// Timeline vocabulary used throughout the app:
+/// - `durationSeconds` is the real timeline the file spans (first kept frame →
+///   last kept frame, by AVFoundation presentation timestamps);
+/// - `contentSeconds` is `frameCount / fps`, i.e. how much footage exists;
+/// - the two differ exactly when frames were dropped (gaps in the timeline).
 struct Recording: Codable, Identifiable, Equatable {
     struct AudioInfo: Codable, Equatable {
         var sampleRate: Int
@@ -74,6 +80,7 @@ struct Recording: Codable, Identifiable, Equatable {
     var frameCount: Int64
     var droppedFrames: Int64
     var sourceDroppedFrames: Int64
+    /// Real timeline spanned by the kept frames (seconds).
     var durationSeconds: Double
     var audio: AudioInfo?
     var files: Files
@@ -86,6 +93,13 @@ struct Recording: Codable, Identifiable, Equatable {
     var appVersion: String
     var notes: String?
 
+    // Timeline details (optional: sidecars written by older builds lack them).
+    var contentSeconds: Double?
+    var deliveredFrames: Int64?
+    var firstPtsNs: Int64?
+    var lastPtsNs: Int64?
+    var pipelineFailure: String?
+
     // Not persisted, filled at scan time.
     var fileSizeBytes: Int64 = 0
     var referenceSizeBytes: Int64 = 0
@@ -95,11 +109,30 @@ struct Recording: Codable, Identifiable, Equatable {
         case captureMode, stage1Codec, preset, stabilization, frameCount, droppedFrames, sourceDroppedFrames
         case durationSeconds, audio, files, stage2, verification, referencePath, telemetry, lowBitsNonZero
         case deviceModel, appVersion, notes
+        case contentSeconds, deliveredFrames, firstPtsNs, lastPtsNs, pipelineFailure
     }
 
     var resolutionLabel: String { height >= 2160 ? "4K" : (height >= 1080 ? "1080p" : "\(width)×\(height)") }
     var hasReference: Bool { files.hevcReference != nil }
     var isReady: Bool { files.mkv != nil && (stage2.status == .done || stage2.status == .notNeeded) }
+
+    /// Footage length (frames / fps); falls back to the timeline when unknown.
+    var contentDuration: Double { contentSeconds ?? (fps > 0 ? Double(frameCount) / Double(fps) : durationSeconds) }
+    /// Share of delivered frames that were kept, when the sidecar knows how many were delivered.
+    var keptFraction: Double? {
+        guard let d = deliveredFrames, d > 0 else { return nil }
+        return Double(frameCount) / Double(d)
+    }
+    var hasGaps: Bool { droppedFrames > 0 && durationSeconds > contentDuration + 0.01 }
+
+    /// One-line timeline description for lists: "21.0 s · 240 fr (4.0 s of footage, 19% kept)".
+    var timelineLabel: String {
+        if hasGaps {
+            let kept = keptFraction.map { String(format: ", %.0f%% kept", $0 * 100) } ?? ""
+            return String(format: "%.1f s timeline · %lld fr (%.1f s footage%@)", durationSeconds, frameCount, contentDuration, kept)
+        }
+        return String(format: "%.1f s · %lld fr", durationSeconds, frameCount)
+    }
 
     static func documentsDirectory() -> URL {
         FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
@@ -130,6 +163,10 @@ struct Recording: Codable, Identifiable, Equatable {
         if let mkv = r.mkvURL, let attrs = try? FileManager.default.attributesOfItem(atPath: mkv.path),
            let size = attrs[.size] as? NSNumber {
             r.fileSizeBytes = size.int64Value
+        }
+        if r.files.mkv == nil, let lci = r.intermediateURL, let attrs = try? FileManager.default.attributesOfItem(atPath: lci.path),
+           let size = attrs[.size] as? NSNumber {
+            r.fileSizeBytes = size.int64Value   // pending two-stage recording: the intermediate holds the footage
         }
         if let ref = r.referenceURL, let attrs = try? FileManager.default.attributesOfItem(atPath: ref.path),
            let size = attrs[.size] as? NSNumber {

@@ -1,6 +1,19 @@
 import Foundation
 import AVFoundation
 
+/// Process-wide note of whether the capture session owns the shared AVAudioSession.
+/// While it does, the player must not change the audio category (that would tear
+/// down the microphone route under a running recording).
+final class AudioSessionState {
+    static let shared = AudioSessionState()
+    private let lock = NSLock()
+    private var active = false
+    var captureActive: Bool {
+        get { lock.lock(); defer { lock.unlock() }; return active }
+        set { lock.lock(); active = newValue; lock.unlock() }
+    }
+}
+
 /// Decodes the FLAC track through libavcodec and plays it with AVAudioEngine.
 /// First-order ambisonic (W Y Z X) content is rendered as a basic stereo
 /// decode (L = W + kY, R = W - kY); the channel count is reported to the UI.
@@ -19,7 +32,9 @@ final class AudioPlayer {
     private let maxInflight = 6
     private var token = 0
     private var startPtsNs: Int64 = 0
+    private var clockStarted = false
     private var running = false
+    private var activatedSession = false
     private(set) var reachedEnd = false
 
     init?(url: URL) {
@@ -41,6 +56,9 @@ final class AudioPlayer {
     deinit {
         stop()
         engine.stop()
+        if activatedSession {
+            try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
+        }
         lc_decoder_close(dec)
     }
 
@@ -53,14 +71,18 @@ final class AudioPlayer {
         let myToken = token
         running = true
         reachedEnd = false
+        clockStarted = false
         startPtsNs = max(ptsNs, 0)
         cond.unlock()
-        let session = AVAudioSession.sharedInstance()
-        try? session.setCategory(.playback, mode: .moviePlayback, options: [])
-        try? session.setActive(true)
+        if !AudioSessionState.shared.captureActive {
+            // Only reconfigure the shared audio session when the camera is not using it.
+            let session = AVAudioSession.sharedInstance()
+            try? session.setCategory(.playback, mode: .moviePlayback, options: [])
+            try? session.setActive(true)
+            activatedSession = true
+        }
         if !engine.isRunning { try? engine.start() }
         _ = lc_decoder_seek_audio(dec, startPtsNs)
-        node.play()
         queue.async { [self] in self.feedLoop(token: myToken) }
     }
 
@@ -74,16 +96,18 @@ final class AudioPlayer {
         node.stop()
     }
 
-    /// Current playback position derived from the audio hardware clock.
+    /// Current playback position derived from the audio hardware clock
+    /// (nil until the first buffer has started playing).
     func currentTimeNs() -> Int64? {
-        cond.lock(); let r = running; let start = startPtsNs; cond.unlock()
-        guard r, let nt = node.lastRenderTime, let pt = node.playerTime(forNodeTime: nt) else { return nil }
+        cond.lock(); let r = running && clockStarted; let start = startPtsNs; cond.unlock()
+        guard r, let nt = node.lastRenderTime, nt.isSampleTimeValid, let pt = node.playerTime(forNodeTime: nt) else { return nil }
         return start + Int64(Double(pt.sampleTime) * 1e9 / Double(sampleRate))
     }
 
     private func feedLoop(token myToken: Int) {
         let chunk = 4096
         var buf = [Int32](repeating: 0, count: chunk * channels)
+        var first = true
         while true {
             // Wait for a free slot (bounded number of scheduled buffers).
             cond.lock()
@@ -125,6 +149,16 @@ final class AudioPlayer {
             node.scheduleBuffer(out) { [weak self] in
                 guard let self = self else { return }
                 self.cond.lock(); self.inflight -= 1; self.cond.signal(); self.cond.unlock()
+            }
+            if first {
+                // The node's sample clock starts at play(); starting it only now, with the first
+                // buffer queued, aligns the clock with that buffer's real timestamp.
+                first = false
+                cond.lock()
+                if pts != Int64.min && pts >= 0 { startPtsNs = pts }
+                clockStarted = true
+                cond.unlock()
+                node.play()
             }
         }
     }

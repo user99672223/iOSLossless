@@ -9,6 +9,7 @@ struct SettingsView: View {
     @Environment(\.dismiss) private var dismiss
 
     private var s: Binding<CaptureSettings> { $settings.settings }
+    private var isRecording: Bool { capture.state == .recording || capture.state == .finishing }
 
     /// Changing these requires a session reconfiguration.
     private var formatSignature: String {
@@ -23,6 +24,15 @@ struct SettingsView: View {
 
     var body: some View {
         Form {
+            if isRecording {
+                Section {
+                    Label("Recording in progress: format, audio and reference changes are applied when it stops.", systemImage: "record.circle")
+                        .font(.caption).foregroundStyle(.red)
+                }
+            }
+            if capture.safeModeLevel > 0 || !capture.fallbacks.isClean || capture.state == .failed {
+                statusSection
+            }
             presetSection
             videoSection
             exposureSection
@@ -32,6 +42,7 @@ struct SettingsView: View {
             captureModeSection
             referenceSection
             jobsSection
+            diagnosticsSection
             aboutSection
         }
         .navigationTitle("Settings")
@@ -42,6 +53,22 @@ struct SettingsView: View {
     }
 
     // MARK: Sections
+
+    private var statusSection: some View {
+        Section {
+            if capture.safeModeLevel > 0 {
+                Label(CaptureManager.safeModeDescription(capture.safeModeLevel), systemImage: "shield.lefthalf.filled").font(.caption).foregroundStyle(.yellow)
+                Button("Leave safe mode and retry the full configuration") { capture.resetSafeMode() }
+            }
+            if !capture.fallbacks.isClean {
+                Label("Automatic fallbacks in effect: \(capture.fallbacks.summary)", systemImage: "arrow.triangle.branch").font(.caption).foregroundStyle(.orange)
+                Text("The requested configuration produced an AVFoundation error on this device; the session was relaxed step by step until it ran. Details are in Diagnostics below.").font(.caption2).foregroundStyle(.secondary)
+            }
+            if capture.state == .failed {
+                Button("Retry camera setup") { capture.retryConfiguration() }
+            }
+        } header: { Text("Session status") }
+    }
 
     private var presetSection: some View {
         Section {
@@ -106,11 +133,13 @@ struct SettingsView: View {
             Picker("Mode", selection: s.exposure) { ForEach(ExposureSetting.allCases) { Text($0.label).tag($0) } }
             if settings.settings.exposure == .locked {
                 let info = capture.deviceInfo
+                let minShutter = max(info.minShutter, 1.0 / 100_000)
+                let maxShutter = max(info.maxShutter, minShutter * 2)
                 VStack(alignment: .leading) {
                     Text("Shutter 1/\(Int((1.0 / max(settings.settings.shutterSeconds, 1e-6)).rounded())) s").font(.caption)
                     Slider(value: Binding(get: { log2(1.0 / max(settings.settings.shutterSeconds, 1e-6)) },
                                           set: { settings.settings.shutterSeconds = 1.0 / pow(2, $0) }),
-                           in: log2(1.0 / info.maxShutter)...log2(1.0 / info.minShutter))
+                           in: log2(1.0 / maxShutter)...log2(1.0 / minShutter))
                 }
                 VStack(alignment: .leading) {
                     Text("ISO \(Int(settings.settings.iso))").font(.caption)
@@ -154,6 +183,12 @@ struct SettingsView: View {
         Section {
             Picker("Audio", selection: s.audio) { ForEach(AudioSetting.allCases) { Text($0.label).tag($0) } }
             LabeledContent("Active") { Text(capture.audioModeDescription).font(.caption) }
+            if !capture.microphoneAuthorized {
+                Label("Microphone access is off for LosslessCam; recordings have no audio.", systemImage: "mic.slash").font(.caption).foregroundStyle(.orange)
+                Button("Open iOS Settings for LosslessCam") {
+                    if let url = URL(string: UIApplication.openSettingsURLString) { UIApplication.shared.open(url) }
+                }
+            }
         } header: { Text("Audio") } footer: {
             Text("Spatial = AVCaptureDeviceInput.multichannelAudioMode .firstOrderAmbisonics (4 channels, ACN/SN3D) stored as 4-channel FLAC; falls back to stereo when unsupported. Samples are stored exactly as delivered (24-bit FLAC, native sample rate, no resampling).")
         }
@@ -165,7 +200,7 @@ struct SettingsView: View {
             if settings.settings.captureMode == .twoStage {
                 Toggle("Stage-1 codec: auto (fastest sustaining from benchmark)", isOn: s.stage1Auto)
                 if settings.settings.stage1Auto {
-                    LabeledContent("Benchmark pick") { Text(benchmark.recommended?.label ?? "not benchmarked yet (default LZ4 + shuffle)").font(.caption) }
+                    LabeledContent("Benchmark pick") { Text(benchmark.recommendation(bitDepth: settings.settings.hdr ? 10 : 8)?.label ?? "not benchmarked at this bit depth (default LZ4 + shuffle)").font(.caption) }
                 } else {
                     Picker("Stage-1 codec", selection: s.stage1Codec) {
                         ForEach(Stage1CodecChoice.allCases) { c in
@@ -179,7 +214,7 @@ struct SettingsView: View {
             LabeledContent("Final FFV1") { Text("v3 · range coder · context 1 · \(settings.settings.ffv1Slices) slices · slice CRC · all intra").font(.caption).multilineTextAlignment(.trailing) }
             LabeledContent("Final FLAC") { Text("level \(settings.settings.flacCompressionLevel) · 24-bit").font(.caption) }
         } header: { Text("Lossless pipeline") } footer: {
-            Text("Two-stage: frames are compressed losslessly with a fast codec during capture and transcoded to FFV1 v3 + FLAC in Matroska after you stop (no real-time constraint). Real-time FFV1 encodes the final format live; frames that cannot be kept up with are counted and reported, never dropped silently.")
+            Text("Two-stage: frames are compressed losslessly with a fast codec during capture and transcoded to FFV1 v3 + FLAC in Matroska after you stop (no real-time constraint). Real-time FFV1 encodes the final format live. Frames the storage path cannot keep up with are dropped, counted and shown — never silently; the file keeps the real timeline with gaps where frames are missing.")
         }
     }
 
@@ -193,19 +228,33 @@ struct SettingsView: View {
     }
 
     private var jobsSection: some View {
-        Section("Background jobs") {
+        Section {
             if stage2.jobs.isEmpty { Text("No stage-2 / verification jobs").foregroundStyle(.secondary) }
             ForEach(stage2.jobs) { j in
                 VStack(alignment: .leading, spacing: 3) {
                     HStack {
                         Text(j.baseName).font(.caption).lineLimit(1)
                         Spacer()
-                        Text(j.kind.rawValue).font(.caption2).foregroundStyle(.secondary)
+                        Text(j.kind.rawValue + (j.paused ? " · paused" : "")).font(.caption2).foregroundStyle(.secondary)
                     }
                     if !j.finished { ProgressView(value: j.progress) }
                     Text(j.phase).font(.caption2).foregroundStyle(j.error == nil ? Color.secondary : Color.red)
                 }
             }
+        } header: { Text("Background jobs") } footer: {
+            Text("Jobs pause automatically while a recording is in progress so the stage-1 workers keep every core.")
+        }
+    }
+
+    private var diagnosticsSection: some View {
+        Section {
+            NavigationLink("Diagnostics log (\(DiagnosticsLog.shared.tail.count) lines)") { DiagnosticsView() }
+            LabeledContent("Camera state", value: capture.state.rawValue)
+            LabeledContent("Permissions", value: "camera \(capture.cameraAuthorized ? "granted" : "denied") · microphone \(capture.microphoneAuthorized ? "granted" : "denied")")
+            LabeledContent("Fallbacks", value: capture.fallbacks.summary)
+            LabeledContent("Safe mode", value: capture.safeModeLevel == 0 ? "off" : "level \(capture.safeModeLevel)")
+        } header: { Text("Diagnostics") } footer: {
+            Text("Session errors (with AVFoundation error codes), caught exceptions, recovery steps and recording summaries. Stored on this device only, in Documents/LosslessCam_diagnostics.log.")
         }
     }
 
@@ -218,9 +267,43 @@ struct SettingsView: View {
                 ScrollView { Text(String(cString: lc_ffmpeg_configuration())).font(.system(.caption2, design: .monospaced)).padding() }
                     .navigationTitle("FFmpeg configure")
             }
-            LabeledContent("Device", value: UIDevice.current.model + " · iOS " + UIDevice.current.systemVersion)
+            LabeledContent("Device", value: CaptureManager.deviceModelIdentifier() + " · iOS " + UIDevice.current.systemVersion)
             LabeledContent("Cores", value: "\(ProcessInfo.processInfo.activeProcessorCount) active")
             LabeledContent("Memory available", value: availableMemoryBytes().byteCountString)
+        }
+    }
+}
+
+/// Scrollable, copyable view of the diagnostics log.
+struct DiagnosticsView: View {
+    @ObservedObject private var log = DiagnosticsLog.shared
+    @State private var copied = false
+
+    var body: some View {
+        ScrollViewReader { proxy in
+            ScrollView {
+                LazyVStack(alignment: .leading, spacing: 2) {
+                    if log.tail.isEmpty { Text("No entries yet").foregroundStyle(.secondary) }
+                    ForEach(Array(log.tail.enumerated()), id: \.offset) { i, line in
+                        Text(line).font(.system(.caption2, design: .monospaced)).textSelection(.enabled).id(i)
+                    }
+                }
+                .padding()
+            }
+            .onAppear { if let last = log.tail.indices.last { proxy.scrollTo(last, anchor: .bottom) } }
+        }
+        .navigationTitle("Diagnostics")
+        .toolbar {
+            ToolbarItem(placement: .topBarTrailing) {
+                Menu {
+                    Button(copied ? "Copied" : "Copy all") {
+                        UIPasteboard.general.string = log.text
+                        copied = true
+                    }
+                    ShareLink(item: log.fileURL) { Label("Share log file", systemImage: "square.and.arrow.up") }
+                    Button("Clear", role: .destructive) { log.clear() }
+                } label: { Image(systemName: "ellipsis.circle") }
+            }
         }
     }
 }

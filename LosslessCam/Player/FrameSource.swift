@@ -25,6 +25,10 @@ struct MediaInfo {
     var container: String
     var ffv1Version: Int
     var sliceCrc: Bool
+    /// Timeline gaps (consecutive frames further apart than 1.5 frame durations) and the
+    /// number of frames those gaps would have held: the trace of frames dropped during capture.
+    var gapCount: Int64 = 0
+    var missingFrames: Int64 = 0
 
     var frameDurationNs: Int64 { fps > 0 ? Int64(1e9 / fps) : 16_666_667 }
     var pixelFormat: OSType { bitDepth == 10 ? (fullRange ? kCVPixelFormatType_420YpCbCr10BiPlanarFullRange : kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange)
@@ -128,12 +132,17 @@ final class FFV1FrameSource: FrameSource {
         let vcodec = withUnsafePointer(to: &liCopy.video_codec) { String(cString: UnsafeRawPointer($0).assumingMemoryBound(to: CChar.self)) }
         let acodec = withUnsafePointer(to: &liCopy.audio_codec) { String(cString: UnsafeRawPointer($0).assumingMemoryBound(to: CChar.self)) }
         let container = withUnsafePointer(to: &liCopy.container) { String(cString: UnsafeRawPointer($0).assumingMemoryBound(to: CChar.self)) }
-        info = MediaInfo(width: Int(li.width), height: Int(li.height), bitDepth: Int(li.bit_depth), fullRange: li.full_range != 0,
-                         fps: fps, frameCount: max(li.frame_count, 1), frameCountExact: li.frame_count_exact != 0,
-                         durationNs: li.duration_ns, videoCodec: vcodec, audioCodec: li.has_audio != 0 ? acodec : nil,
-                         sampleRate: Int(li.sample_rate), channels: Int(li.channels), ambisonic: li.audio_ambisonic != 0,
-                         isHDR: isHDR, colorPrimaries: li.color_primaries, colorTransfer: li.color_trc, colorMatrix: li.colorspace,
-                         container: container, ffv1Version: Int(li.ffv1_version), sliceCrc: li.ffv1_slicecrc != 0)
+        var gaps: Int64 = 0, missing: Int64 = 0
+        lc_decoder_timeline_stats(d, &gaps, &missing)
+        var mi = MediaInfo(width: Int(li.width), height: Int(li.height), bitDepth: Int(li.bit_depth), fullRange: li.full_range != 0,
+                           fps: fps, frameCount: max(li.frame_count, 1), frameCountExact: li.frame_count_exact != 0,
+                           durationNs: li.duration_ns, videoCodec: vcodec, audioCodec: li.has_audio != 0 ? acodec : nil,
+                           sampleRate: Int(li.sample_rate), channels: Int(li.channels), ambisonic: li.audio_ambisonic != 0,
+                           isHDR: isHDR, colorPrimaries: li.color_primaries, colorTransfer: li.color_trc, colorMatrix: li.colorspace,
+                           container: container, ffv1Version: Int(li.ffv1_version), sliceCrc: li.ffv1_slicecrc != 0)
+        mi.gapCount = gaps
+        mi.missingFrames = missing
+        info = mi
         dec = d
         pool = PixelBufferPool(width: info.width, height: info.height, pixelFormat: info.pixelFormat, isHDR: isHDR, fullRange: info.fullRange)
     }
@@ -275,13 +284,18 @@ final class HEVCFrameSource: FrameSource {
         lock.lock(); defer { lock.unlock() }
         let idx = min(max(index, 0), info.frameCount - 1)
         let target = pts(ofFrame: idx)
-        if reader == nil || idx != nextIndex || reader?.status != .reading {
+        // Keep the running reader for forward jumps of up to two seconds (skipping is far
+        // cheaper than tearing down and recreating the decoder); restart otherwise.
+        let forwardSkipLimit = Int64(max(info.fps * 2, 1))
+        let canSkipForward = reader != nil && reader?.status == .reading && nextIndex >= 0 && idx >= nextIndex && idx - nextIndex <= forwardSkipLimit
+        if !canSkipForward {
             guard restart(at: target) else { return nil }
         }
         guard let out = output else { return nil }
         let half = info.frameDurationNs / 2
+        let maxAttempts = Int(forwardSkipLimit) + 60
         var attempts = 0
-        while attempts < 600 {
+        while attempts < maxAttempts {
             attempts += 1
             guard let sb = out.copyNextSampleBuffer() else {
                 nextIndex = -1
@@ -295,6 +309,7 @@ final class HEVCFrameSource: FrameSource {
             nextIndex = idx + 1
             return DecodedFrame(pixelBuffer: pb, index: idx, ptsNs: ptsNs)
         }
+        nextIndex = -1
         return nil
     }
 }

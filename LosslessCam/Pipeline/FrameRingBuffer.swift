@@ -25,8 +25,13 @@ final class FrameSlot {
 /// copied into buffers from a private pool so the capture pool never starves.
 /// When the queue is full the frame is rejected and the caller counts a drop:
 /// nothing is ever dropped silently.
+///
+/// Consumed slots are released immediately (the queue stores optionals and
+/// clears the entry on pop), so a frame's memory returns to its pool as soon
+/// as the worker is done with it; the pool itself is flushed when the buffer
+/// is drained after a recording.
 final class FrameRingBuffer {
-    private var slots: [FrameSlot] = []
+    private var slots: [FrameSlot?] = []
     private var head = 0
     private let lock = NSCondition()
     private var closed = false
@@ -42,6 +47,7 @@ final class FrameRingBuffer {
     init(capacity: Int, maxCameraOwned: Int = 2) {
         self.capacity = max(2, capacity)
         self.maxCameraOwned = maxCameraOwned
+        slots.reserveCapacity(self.capacity + 256)
     }
 
     var count: Int {
@@ -50,7 +56,12 @@ final class FrameRingBuffer {
     }
 
     func setCapacity(_ newCapacity: Int) {
-        lock.lock(); capacity = max(2, newCapacity); lock.unlock()
+        lock.lock()
+        capacity = max(2, newCapacity)
+        let p = pool
+        lock.unlock()
+        // Return buffers beyond the new capacity to the system so the shrink actually frees memory.
+        if let p = p { CVPixelBufferPoolFlush(p, .excessBuffers) }
     }
 
     /// Returns false (drop) when the buffer is full.
@@ -85,6 +96,7 @@ final class FrameRingBuffer {
     }
 
     /// Blocks until a frame is available or the buffer is closed and drained.
+    /// The returned slot is the only remaining reference to its frame.
     func pop() -> FrameSlot? {
         lock.lock()
         while slots.count - head == 0 && !closed {
@@ -95,8 +107,9 @@ final class FrameRingBuffer {
             return nil
         }
         let slot = slots[head]
+        slots[head] = nil
         head += 1
-        if head > 1024 && head * 2 > slots.count {
+        if head >= 256 {
             slots.removeFirst(head)
             head = 0
         }
@@ -115,9 +128,21 @@ final class FrameRingBuffer {
         lock.lock(); closed = true; lock.broadcast(); lock.unlock()
     }
 
+    /// Drops every queued frame and the private pool. Call after the consumers have exited.
+    func releaseResources() {
+        lock.lock()
+        slots.removeAll()
+        head = 0
+        let p = pool
+        pool = nil
+        lock.unlock()
+        if let p = p { CVPixelBufferPoolFlush(p, []) }
+    }
+
     private func copyFrame(_ src: CVPixelBuffer) -> CVPixelBuffer? {
         let w = CVPixelBufferGetWidth(src), h = CVPixelBufferGetHeight(src)
         let fmt = CVPixelBufferGetPixelFormatType(src)
+        lock.lock()
         if pool == nil || poolWidth != w || poolHeight != h || poolFormat != fmt {
             let attrs: [CFString: Any] = [
                 kCVPixelBufferPixelFormatTypeKey: fmt,
@@ -125,12 +150,17 @@ final class FrameRingBuffer {
                 kCVPixelBufferHeightKey: h,
                 kCVPixelBufferIOSurfacePropertiesKey: [:] as CFDictionary
             ]
+            let poolAttrs: [CFString: Any] = [
+                kCVPixelBufferPoolMinimumBufferCountKey: 2
+            ]
             var p: CVPixelBufferPool?
-            CVPixelBufferPoolCreate(nil, nil, attrs as CFDictionary, &p)
+            CVPixelBufferPoolCreate(nil, poolAttrs as CFDictionary, attrs as CFDictionary, &p)
             pool = p
             poolWidth = w; poolHeight = h; poolFormat = fmt
         }
-        guard let pool = pool else { return nil }
+        let poolRef = pool
+        lock.unlock()
+        guard let pool = poolRef else { return nil }
         var dstOpt: CVPixelBuffer?
         guard CVPixelBufferPoolCreatePixelBuffer(nil, pool, &dstOpt) == kCVReturnSuccess, let dst = dstOpt else { return nil }
         CVPixelBufferLockBaseAddress(src, .readOnly)

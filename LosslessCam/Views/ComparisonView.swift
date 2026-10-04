@@ -8,6 +8,7 @@ struct ComparisonView: View {
     @StateObject private var holder = Holder()
     @State private var scrub: Double = 0
     @State private var scrubbing = false
+    @Environment(\.scenePhase) private var scenePhase
 
     final class Holder: ObservableObject {
         @Published var model: ComparisonModel?
@@ -38,6 +39,7 @@ struct ComparisonView: View {
         .navigationBarTitleDisplayMode(.inline)
         .onAppear { holder.load(a: urlA, b: urlB) }
         .onDisappear { holder.model?.pause() }
+        .onChange(of: scenePhase) { _, phase in if phase != .active { holder.model?.pause() } }
     }
 }
 
@@ -47,25 +49,28 @@ private struct ComparisonBody: View {
     @Binding var scrubbing: Bool
     let titleA: String
     let titleB: String
+    @AppStorage("player.showOverlay") private var showOverlay = true
 
     var body: some View {
         VStack(spacing: 0) {
             ZStack(alignment: .topLeading) {
                 VideoRenderViewRepresentable(view: model.renderView)
-                VStack(alignment: .leading, spacing: 2) {
-                    Text("A \(titleA) · frame \(model.currentIndex)   B \(titleB) · frame \(model.currentIndexB) (offset \(model.offsetFrames))").font(.caption2.monospacedDigit()).lineLimit(2)
-                    Text(String(format: "%@ · decode %.1f pairs/s · %@", timestamp(model.currentPtsNs), model.decodeFps, model.infoA.colorLabel)).font(.caption2.monospacedDigit())
-                    Text(metricsLine).font(.caption.monospacedDigit().bold())
-                    if let p = model.inspector {
-                        Text("\(p.source) px (\(p.x), \(p.y))  Y \(p.yCode)  Cb \(p.cbCode)  Cr \(p.crCode)").font(.caption.monospacedDigit().bold()).foregroundStyle(.yellow)
+                if showOverlay {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("A \(titleA) · frame \(model.currentIndex)   B \(titleB) · frame \(model.currentIndexB) (offset \(model.offsetFrames))").font(.caption2.monospacedDigit()).lineLimit(2)
+                        Text(String(format: "%@ / %@ · decode %.1f pairs/s · %@", timestamp(model.currentPtsNs), timestamp(model.infoA.durationNs), model.decodeFps, model.infoA.colorLabel)).font(.caption2.monospacedDigit())
+                        Text(metricsLine).font(.caption.monospacedDigit().bold())
+                        if let p = model.inspector {
+                            Text("\(p.source) px (\(p.x), \(p.y))  Y \(p.yCode)  Cb \(p.cbCode)  Cr \(p.crCode)").font(.caption.monospacedDigit().bold()).foregroundStyle(.yellow)
+                        }
+                        if model.mode == .abFlip { Text("showing \(model.params.showB ? "B" : "A") — tap to swap, hold to peek").font(.caption2).foregroundStyle(.secondary) }
+                        if model.mode == .wipe { Text("drag to move the divider · two fingers to pan").font(.caption2).foregroundStyle(.secondary) }
+                        if !model.statusText.isEmpty { Text(model.statusText).font(.caption2).foregroundStyle(.orange) }
                     }
-                    if model.mode == .abFlip { Text("showing \(model.params.showB ? "B" : "A") — tap to swap, hold to peek").font(.caption2).foregroundStyle(.secondary) }
-                    if model.mode == .wipe { Text("drag to move the divider · two fingers to pan").font(.caption2).foregroundStyle(.secondary) }
-                    if !model.statusText.isEmpty { Text(model.statusText).font(.caption2).foregroundStyle(.orange) }
+                    .padding(8)
+                    .background(.black.opacity(0.5), in: RoundedRectangle(cornerRadius: 8))
+                    .padding(8)
                 }
-                .padding(8)
-                .background(.black.opacity(0.5), in: RoundedRectangle(cornerRadius: 8))
-                .padding(8)
             }
             controls
         }
@@ -110,6 +115,7 @@ private struct ComparisonBody: View {
                     Button("Reset averages") { model.resetAverages() }
                     Button("Reset zoom") { model.resetView() }
                     Toggle("Nearest-neighbour sampling", isOn: Binding(get: { model.params.nearest }, set: { model.params.nearest = $0 }))
+                    Toggle("Show info overlay", isOn: $showOverlay)
                     ForEach([0.25, 0.5, 1.0, 2.0], id: \.self) { s in Button(String(format: "Speed %g×", s)) { model.speed = s } }
                 } label: { Image(systemName: "gearshape") }
             }
@@ -121,7 +127,7 @@ private struct ComparisonBody: View {
     }
 
     private func timestamp(_ ns: Int64) -> String {
-        let s = Double(ns) / 1e9
+        let s = Double(max(ns, 0)) / 1e9
         let m = Int(s) / 60
         return String(format: "%02d:%06.3f", m, s - Double(m * 60))
     }

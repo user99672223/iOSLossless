@@ -3,6 +3,8 @@ import SwiftUI
 struct VerificationBadge: View {
     let state: Recording.VerificationState
     let stage2: Recording.Stage2State
+    /// Live job for this recording (progress shown instead of the persisted value).
+    var job: Stage2Runner.Job? = nil
     var body: some View {
         badge(label.0, label.1, label.2)
     }
@@ -14,6 +16,11 @@ struct VerificationBadge: View {
             .foregroundStyle(color)
     }
     private var label: (String, Color, String) {
+        if let j = job, !j.finished {
+            let p = Int(j.progress * 100)
+            if j.kind == .transcode { return (j.paused ? "Stage 2 paused \(p)%" : "Stage 2 \(p)%", .blue, "gearshape.2") }
+            return (j.paused ? "Verifying (paused)" : "Verifying \(p)%", .blue, "hourglass")
+        }
         switch stage2.status {
         case .pending, .running: return ("Stage 2 \(Int(stage2.progress * 100))%", .blue, "gearshape.2")
         case .failed: return ("Stage 2 failed", .red, "xmark.octagon")
@@ -88,13 +95,14 @@ struct LibraryView: View {
 }
 
 struct RecordingRow: View {
+    @EnvironmentObject var stage2: Stage2Runner
     let recording: Recording
     var body: some View {
         HStack(spacing: 10) {
             ThumbnailView(recording: recording)
             VStack(alignment: .leading, spacing: 3) {
                 Text(recording.baseName).font(.caption).lineLimit(1)
-                Text("\(recording.resolutionLabel) · \(recording.fps) fps · \(recording.bitDepth)-bit \(recording.hdr ? "HLG" : "SDR") · \(recording.durationSeconds.durationString) · \(recording.fileSizeBytes.byteCountString)")
+                Text("\(recording.resolutionLabel) · \(recording.fps) fps · \(recording.bitDepth)-bit \(recording.hdr ? "HLG" : "SDR") · \(recording.timelineLabel) · \(recording.fileSizeBytes.byteCountString)")
                     .font(.caption2.monospacedDigit()).foregroundStyle(.secondary)
                 HStack(spacing: 6) {
                     Text(recording.files.mkv != nil ? "FFV1" + (recording.audio != nil ? "+FLAC" : "") : (recording.files.intermediate != nil ? "intermediate" : "—"))
@@ -102,7 +110,18 @@ struct RecordingRow: View {
                     if recording.hasReference {
                         Label("HEVC ref", systemImage: "link").font(.caption2).padding(.horizontal, 5).padding(.vertical, 2).background(Color.secondary.opacity(0.2), in: Capsule())
                     }
-                    VerificationBadge(state: recording.verification, stage2: recording.stage2)
+                    if recording.droppedFrames + recording.sourceDroppedFrames > 0 {
+                        Label("\(recording.droppedFrames + recording.sourceDroppedFrames) dropped", systemImage: "exclamationmark.triangle.fill")
+                            .font(.caption2.bold()).padding(.horizontal, 5).padding(.vertical, 2)
+                            .background(Color.red.opacity(0.2), in: Capsule()).foregroundStyle(.red)
+                    }
+                    if recording.pipelineFailure != nil {
+                        Label("stopped early", systemImage: "xmark.octagon.fill")
+                            .font(.caption2.bold()).padding(.horizontal, 5).padding(.vertical, 2)
+                            .background(Color.red.opacity(0.2), in: Capsule()).foregroundStyle(.red)
+                    }
+                    VerificationBadge(state: recording.verification, stage2: recording.stage2,
+                                      job: stage2.jobs.first(where: { $0.baseName == recording.baseName && !$0.finished }))
                 }
             }
         }
@@ -117,6 +136,7 @@ struct RecordingDetailView: View {
     @State private var compareWithID: String?
     @State private var showPicker = false
     @State private var confirmDelete = false
+    @Environment(\.dismiss) private var dismiss
 
     private var recording: Recording? { library.recordings.first { $0.baseName == recordingID } }
     private func recording(named id: String) -> Recording? { library.recordings.first { $0.baseName == id } }
@@ -126,10 +146,24 @@ struct RecordingDetailView: View {
             List {
                 Section {
                     ThumbnailView(recording: r).frame(maxWidth: .infinity, alignment: .center).scaleEffect(2.4).frame(height: 140)
-                    VerificationBadge(state: r.verification, stage2: r.stage2)
+                    VerificationBadge(state: r.verification, stage2: r.stage2, job: stage2.jobs.first(where: { $0.baseName == r.baseName && !$0.finished }))
                     if let job = stage2.jobs.first(where: { $0.baseName == r.baseName && !$0.finished }) {
-                        ProgressView(value: job.progress) { Text(job.phase).font(.caption) }
+                        ProgressView(value: job.progress) { Text(job.paused ? job.phase + " (paused while recording)" : job.phase).font(.caption) }
                     }
+                }
+                if r.droppedFrames > 0 || r.pipelineFailure != nil {
+                    Section {
+                        if let f = r.pipelineFailure {
+                            Label(f, systemImage: "xmark.octagon.fill").font(.caption).foregroundStyle(.red)
+                        }
+                        if r.droppedFrames > 0 {
+                            let kept = r.keptFraction.map { String(format: " (%.0f%% of the delivered frames kept)", $0 * 100) } ?? ""
+                            Label(String(format: "%lld frames were dropped during capture%@. The file keeps the real %.1f s timeline with gaps; it holds %.1f s of footage. The HEVC reference is continuous.", r.droppedFrames, kept, r.durationSeconds, r.contentDuration), systemImage: "exclamationmark.triangle.fill")
+                                .font(.caption).foregroundStyle(.orange)
+                            Text("To keep every frame: lower the resolution or frame rate, run the stage-1 benchmark (Settings → Lossless pipeline), free storage, or let a running stage-2 job finish before recording.")
+                                .font(.caption2).foregroundStyle(.secondary)
+                        }
+                    } header: { Text("Capture warnings") }
                 }
                 Section("Actions") {
                     if let mkv = r.mkvURL, r.isReady {
@@ -145,12 +179,12 @@ struct RecordingDetailView: View {
                     if let ref = r.referenceURL {
                         NavigationLink("Play HEVC reference") { PlayerView(url: ref, title: r.baseName + " (HEVC)") }
                     }
-                    if r.files.intermediate != nil, r.stage2.status != .running, r.files.mkv == nil {
-                        Button("Run stage 2 now") {
+                    if r.files.intermediate != nil, !stage2.isBusy(baseName: r.baseName) {
+                        Button(r.files.mkv == nil ? "Run stage 2 now" : "Run stage 2 again (rebuild MKV from the intermediate)") {
                             Stage2Runner.shared.enqueue(recording: r, ffv1: settings.settings.ffv1Params, flacLevel: settings.settings.flacCompressionLevel, metadata: ["LOSSLESSCAM_STAGE2", "manual"])
                         }
                     }
-                    if r.stage2.status == .running { Button("Cancel stage 2", role: .destructive) { Stage2Runner.shared.cancel(baseName: r.baseName) } }
+                    if stage2.isBusy(baseName: r.baseName) { Button("Cancel stage 2 / verification", role: .destructive) { Stage2Runner.shared.cancel(baseName: r.baseName) } }
                     Button("Delete recording", role: .destructive) { confirmDelete = true }
                 }
                 Section("Verification") {
@@ -167,7 +201,8 @@ struct RecordingDetailView: View {
                     row("Created", r.createdAt.formatted(date: .abbreviated, time: .standard))
                     row("Video", "\(r.width)×\(r.height) · \(r.fps) fps · \(r.bitDepth)-bit · \(r.fullRange ? "full" : "video") range · source \(r.pixelFormatFourCC)")
                     row("Colour", r.colorDescription)
-                    row("Frames", "\(r.frameCount) written · \(r.droppedFrames) dropped by pipeline · \(r.sourceDroppedFrames) dropped by source")
+                    row("Timeline", String(format: "%.2f s (first to last kept frame) · footage %.2f s (%lld frames ÷ %ld fps)", r.durationSeconds, r.contentDuration, r.frameCount, r.fps))
+                    row("Frames", "\(r.frameCount) written · \(r.deliveredFrames.map { "\($0) delivered · " } ?? "")\(r.droppedFrames) dropped by pipeline · \(r.sourceDroppedFrames) dropped by source")
                     row("Mode", r.captureMode + (r.stage1Codec.map { " · stage 1 \($0)" } ?? ""))
                     row("Preset", "\(r.preset) · stabilization \(r.stabilization)")
                     if let a = r.audio {
@@ -179,7 +214,7 @@ struct RecordingDetailView: View {
                     } else { row("Audio", "none") }
                     row("Reference", r.referencePath)
                     if r.lowBitsNonZero { Text("Padding bits of the 10-bit samples were non-zero in the source buffers; only the 10-bit values are stored.").font(.caption).foregroundStyle(.orange) }
-                    row("Telemetry", String(format: "avg %.1f fps · avg %.0f MB/s · peak buffer %.0f%% · thermal max %d · %d memory warnings", r.telemetry.averageFps, r.telemetry.averageWriteMBps, r.telemetry.peakBufferFill * 100, r.telemetry.maxThermalState, r.telemetry.memoryWarnings))
+                    row("Telemetry", String(format: "avg %.1f fps · avg %.0f MB/s · peak buffer %.0f%% · thermal max %ld · %ld memory warnings", r.telemetry.averageFps, r.telemetry.averageWriteMBps, r.telemetry.peakBufferFill * 100, r.telemetry.maxThermalState, r.telemetry.memoryWarnings))
                     if r.stage2.status != .notNeeded {
                         row("Stage 2", "\(r.stage2.status.rawValue)" + (r.stage2.seconds > 0 ? String(format: " · %.1f s", r.stage2.seconds) : "") + (r.stage2.intermediateHashMismatches > 0 ? " · \(r.stage2.intermediateHashMismatches) intermediate hash mismatches" : "") + (r.stage2.error.map { " · \($0)" } ?? ""))
                     }
@@ -189,7 +224,7 @@ struct RecordingDetailView: View {
                     if let m = r.files.mkv { row("MKV", "\(m) · \(r.fileSizeBytes.byteCountString)") }
                     if let h = r.files.hevcReference { row("HEVC", "\(h) · \(r.referenceSizeBytes.byteCountString)") }
                     row("Hash list", r.files.hashList)
-                    if let i = r.files.intermediate { row("Intermediate", i) }
+                    if let i = r.files.intermediate { row("Intermediate", i + " (kept until the MKV verifies)") }
                     row("Sidecar", r.baseName + ".json")
                 }
             }
@@ -206,7 +241,7 @@ struct RecordingDetailView: View {
                 }
             }
             .confirmationDialog("Delete this recording and its files?", isPresented: $confirmDelete, titleVisibility: .visible) {
-                Button("Delete", role: .destructive) { library.delete(r) }
+                Button("Delete", role: .destructive) { library.delete(r); dismiss() }
             }
         } else {
             ContentUnavailableView("Recording not found", systemImage: "questionmark.folder")

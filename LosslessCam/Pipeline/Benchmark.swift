@@ -48,6 +48,11 @@ final class BenchmarkRunner: ObservableObject {
         if let data = try? JSONEncoder().encode(results) { UserDefaults.standard.set(data, forKey: key) }
     }
 
+    /// Recommendation measured at the given bit depth (results from the other depth do not apply).
+    func recommendation(bitDepth: Int) -> Stage1CodecChoice? {
+        Self.pick(from: results.filter { $0.bitDepth == bitDepth })
+    }
+
     static func pick(from results: [Result]) -> Stage1CodecChoice? {
         let ok = results.filter { $0.supported && $0.sustainsTarget }
         // Fastest sustaining option; ties broken by better compression.
@@ -227,8 +232,10 @@ final class BenchmarkRunner: ObservableObject {
                     var size: Int = 0
                     let rc = lc_s1_encoder_compress(enc, f, stride, f + stride * height, stride, &out, &size)
                     if rc < 0 { totals.fail("compress failed (\(rc))"); break }
+                    // The real worker hashes every captured frame (full memory pass); so does the benchmark.
+                    let fh = lc_hash_bytes(f, rawSize)
                     if let wr = writerRef, let out = out {
-                        let h = lc_hash_bytes(out, min(size, 4096))
+                        let h = fh
                         if lc_lci_append_video(wr, Int64(i), Int64(i) * 16_666_667, h, out, size, rawSize) != 0 {
                             totals.fail("write failed (disk full?)")
                             break

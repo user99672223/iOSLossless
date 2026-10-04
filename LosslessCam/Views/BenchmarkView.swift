@@ -7,6 +7,8 @@ struct BenchmarkView: View {
     @State private var seconds: Double = 6
     @State private var use4K60 = true
 
+    private var isRecording: Bool { capture.state == .recording || capture.state == .finishing }
+
     var body: some View {
         List {
             Section {
@@ -20,7 +22,10 @@ struct BenchmarkView: View {
                     Text("\(Int(seconds)) s").monospacedDigit()
                 }
                 Button(benchmark.running ? "Running…" : "Run benchmark") { run() }
-                    .disabled(benchmark.running)
+                    .disabled(benchmark.running || isRecording)
+                if isRecording {
+                    Text("Stop the recording first: the benchmark needs every core and the flash bandwidth.").font(.caption).foregroundStyle(.orange)
+                }
                 if benchmark.running {
                     ProgressView(value: benchmark.progress)
                     Text(benchmark.status).font(.caption).foregroundStyle(.secondary)
@@ -57,7 +62,7 @@ struct BenchmarkView: View {
                 }
                 Section("Recommendation") {
                     if let rec = benchmark.recommended {
-                        let sustains = benchmark.results.first { $0.codec == rec.rawValue }?.sustainsTarget ?? false
+                        let sustains = benchmark.results.first(where: { $0.codec == rec.rawValue })?.sustainsTarget ?? false
                         Text(sustains ? "Fastest sustaining codec: \(rec.label)" : "No codec sustains the target on this device; fastest is \(rec.label). Expect dropped frames at this mode (they are counted and reported).")
                             .font(.subheadline)
                         Toggle("Use benchmark pick automatically", isOn: $settings.settings.stage1Auto)
@@ -78,8 +83,8 @@ struct BenchmarkView: View {
         let w = use4K60 ? 3840 : Int(fmt?.width ?? 3840)
         let h = use4K60 ? 2160 : Int(fmt?.height ?? 2160)
         let bps = use4K60 ? 2 : ((fmt?.is10Bit ?? true) ? 2 : 1)
-        let fps = use4K60 ? 60 : settings.settings.frameRate.rawValue
-        let sample = capture.pipeline.latestFrameForBenchmark
+        let fps = use4K60 ? 60 : capture.activeFps
+        let sample = capture.pipeline.benchmarkSample()
         benchmark.run(width: w, height: h, bytesPerSample: bps, targetFps: fps, seconds: seconds, sampleFrame: sample)
     }
 }

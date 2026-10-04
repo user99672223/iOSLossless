@@ -55,8 +55,8 @@ final class HDRRenderer {
     private let pipeline: MTLRenderPipelineState
     private var textureCache: CVMetalTextureCache?
     private let lock = NSLock()
-    private(set) var lastTransform = matrix_identity_float3x3
-    private(set) var lastViewportSize = CGSize(width: 1, height: 1)
+    private var lastTransform = matrix_identity_float3x3
+    private var lastViewportSize = CGSize(width: 1, height: 1)
 
     init?(pixelFormat: MTLPixelFormat) {
         guard let dev = MTLCreateSystemDefaultDevice(), let q = dev.makeCommandQueue(),
@@ -72,6 +72,12 @@ final class HDRRenderer {
         guard let p = try? dev.makeRenderPipelineState(descriptor: desc) else { return nil }
         pipeline = p
         CVMetalTextureCacheCreate(nil, nil, dev, nil, &textureCache)
+    }
+
+    /// Last viewport→texture transform and viewport size used for drawing (thread-safe snapshot).
+    func currentMapping() -> (transform: simd_float3x3, viewport: CGSize) {
+        lock.lock(); defer { lock.unlock() }
+        return (lastTransform, lastViewportSize)
     }
 
     private func texture(from pb: CVPixelBuffer, plane: Int, bitDepth: Int) -> MTLTexture? {
@@ -141,15 +147,33 @@ final class HDRRenderer {
 }
 
 /// UIView hosting the CAMetalLayer, handling pinch/pan/tap/long-press and
-/// presenting frames from any thread.
+/// presenting frames from any thread. Frame references and parameters are
+/// guarded by a lock because decode threads write them while UIKit reads them;
+/// no GPU work is submitted while the app is in the background.
 final class VideoRenderView: UIView {
     override class var layerClass: AnyClass { CAMetalLayer.self }
     var metalLayer: CAMetalLayer { layer as! CAMetalLayer }
 
     private(set) var renderer: HDRRenderer?
-    private(set) var frameA: CVPixelBuffer?
-    private(set) var frameB: CVPixelBuffer?
-    var params = RenderParams() { didSet { if params != oldValue { redraw() } } }
+    private let stateLock = NSLock()
+    private var frameAStorage: CVPixelBuffer?
+    private var frameBStorage: CVPixelBuffer?
+    private var paramsStorage = RenderParams()
+    private var backgrounded = false
+    private var observers: [NSObjectProtocol] = []
+
+    var frameA: CVPixelBuffer? { stateLock.lock(); defer { stateLock.unlock() }; return frameAStorage }
+    var frameB: CVPixelBuffer? { stateLock.lock(); defer { stateLock.unlock() }; return frameBStorage }
+    var params: RenderParams {
+        get { stateLock.lock(); defer { stateLock.unlock() }; return paramsStorage }
+        set {
+            stateLock.lock()
+            let changed = paramsStorage != newValue
+            paramsStorage = newValue
+            stateLock.unlock()
+            if changed { redraw() }
+        }
+    }
     var bitDepth = 10
     var fullRange = false
     var isBT2020 = true
@@ -163,12 +187,15 @@ final class VideoRenderView: UIView {
 
     private var pinchStartZoom: Float = 1
     private var panStart = SIMD2<Float>(0, 0)
+    private var panIsDividerDrag = false
 
     override init(frame: CGRect) {
         super.init(frame: frame)
         setup()
     }
     required init?(coder: NSCoder) { super.init(coder: coder); setup() }
+
+    deinit { observers.forEach { NotificationCenter.default.removeObserver($0) } }
 
     private func setup() {
         backgroundColor = .black
@@ -178,6 +205,18 @@ final class VideoRenderView: UIView {
         renderer = HDRRenderer(pixelFormat: .rgba16Float)
         metalLayer.device = renderer?.device
         configureColor(isHDR: true)
+
+        let nc = NotificationCenter.default
+        backgrounded = UIApplication.shared.applicationState == .background
+        observers.append(nc.addObserver(forName: UIApplication.didEnterBackgroundNotification, object: nil, queue: nil) { [weak self] _ in
+            guard let self = self else { return }
+            self.stateLock.lock(); self.backgrounded = true; self.stateLock.unlock()
+        })
+        observers.append(nc.addObserver(forName: UIApplication.willEnterForegroundNotification, object: nil, queue: .main) { [weak self] _ in
+            guard let self = self else { return }
+            self.stateLock.lock(); self.backgrounded = false; self.stateLock.unlock()
+            self.redraw()
+        })
 
         let pinch = UIPinchGestureRecognizer(target: self, action: #selector(handlePinch(_:)))
         let pan = UIPanGestureRecognizer(target: self, action: #selector(handlePan(_:)))
@@ -219,32 +258,40 @@ final class VideoRenderView: UIView {
 
     /// Thread-safe: may be called from decode threads.
     func present(frameA: CVPixelBuffer?, frameB: CVPixelBuffer?) {
-        self.frameA = frameA
-        self.frameB = frameB
+        stateLock.lock()
+        frameAStorage = frameA
+        frameBStorage = frameB
+        stateLock.unlock()
         redraw()
     }
 
     func redraw() {
         guard let r = renderer else { return }
-        r.render(to: metalLayer, frameA: frameA, frameB: frameB, bitDepth: bitDepth, fullRange: fullRange,
-                 isBT2020: isBT2020, params: params, isHDRLayer: isHDRLayer)
+        stateLock.lock()
+        let a = frameAStorage, b = frameBStorage, p = paramsStorage, bg = backgrounded
+        stateLock.unlock()
+        // GPU work from a background process is refused by iOS and gets the app terminated.
+        if bg { return }
+        r.render(to: metalLayer, frameA: a, frameB: b, bitDepth: bitDepth, fullRange: fullRange,
+                 isBT2020: isBT2020, params: p, isHDRLayer: isHDRLayer)
     }
 
     /// Maps a point in view coordinates to a pixel position in the frame (nil if outside).
     func pixelPosition(for point: CGPoint) -> (x: Int, y: Int, isB: Bool)? {
         guard let a = frameA, let r = renderer else { return nil }
+        let p = params
         var u = Float(point.x / max(bounds.width, 1))
         let v = Float(point.y / max(bounds.height, 1))
         var isB = false
-        if params.mode == .sideBySide {
+        if p.mode == .sideBySide {
             isB = u >= 0.5
             u = isB ? (u - 0.5) * 2 : u * 2
-        } else if params.mode == .wipe {
-            isB = u >= params.divider
-        } else if params.mode == .abFlip {
-            isB = params.showB
+        } else if p.mode == .wipe {
+            isB = u >= p.divider
+        } else if p.mode == .abFlip {
+            isB = p.showB
         }
-        let t = r.lastTransform * SIMD3<Float>(u, v, 1)
+        let t = r.currentMapping().transform * SIMD3<Float>(u, v, 1)
         guard t.x >= 0, t.x < 1, t.y >= 0, t.y < 1 else { return nil }
         let w = CVPixelBufferGetWidth(a), h = CVPixelBufferGetHeight(a)
         return (Int(t.x * Float(w)), Int(t.y * Float(h)), isB && frameB != nil)
@@ -267,7 +314,13 @@ final class VideoRenderView: UIView {
 
     @objc private func handlePan(_ g: UIPanGestureRecognizer) {
         let tr = g.translation(in: self)
-        if dividerDragEnabled && params.mode == .wipe && g.numberOfTouches <= 1 {
+        if g.state == .began {
+            // Decide once per gesture: a one-finger drag in wipe mode moves the divider, anything else pans.
+            panIsDividerDrag = dividerDragEnabled && params.mode == .wipe && g.numberOfTouches <= 1
+            panStart = params.pan
+        }
+        if panIsDividerDrag {
+            guard g.state == .began || g.state == .changed else { return }
             var p = params
             p.divider = min(max(Float(g.location(in: self).x / max(bounds.width, 1)), 0.02), 0.98)
             params = p
@@ -275,13 +328,13 @@ final class VideoRenderView: UIView {
             return
         }
         switch g.state {
-        case .began: panStart = params.pan
         case .changed:
             var p = params
             // Translate in texture units: full view width == 1/zoom of texture (after fit).
-            let fx = Float(renderer?.lastTransform.columns.0.x ?? 1)
-            let fy = Float(renderer?.lastTransform.columns.1.y ?? 1)
-            let vw = params.mode == .sideBySide ? bounds.width / 2 : bounds.width
+            let mapping = renderer?.currentMapping().transform ?? matrix_identity_float3x3
+            let fx = Float(mapping.columns.0.x)
+            let fy = Float(mapping.columns.1.y)
+            let vw = p.mode == .sideBySide ? bounds.width / 2 : bounds.width
             p.pan = SIMD2<Float>(panStart.x - Float(tr.x / max(vw, 1)) * fx, panStart.y - Float(tr.y / max(bounds.height, 1)) * fy)
             p.pan = clampPan(p.pan, zoom: p.zoom)
             params = p

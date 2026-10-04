@@ -28,18 +28,33 @@ final class LibraryStore: ObservableObject {
             let dir = Recording.documentsDirectory()
             var found: [Recording] = []
             var seen = Set<String>()
-            let items = (try? FileManager.default.contentsOfDirectory(at: dir, includingPropertiesForKeys: [.fileSizeKey], options: [.skipsHiddenFiles])) ?? []
+            let items = (try? FileManager.default.contentsOfDirectory(at: dir, includingPropertiesForKeys: [.fileSizeKey, .contentModificationDateKey], options: [.skipsHiddenFiles])) ?? []
             for url in items where url.pathExtension == "json" {
                 if let r = try? Recording.load(from: url) {
                     found.append(r)
                     seen.insert(r.baseName)
                 }
             }
-            // Orphan MKVs (imported through Files, or whose sidecar was lost).
+            // A file still being written (the recording in progress) has no sidecar yet: leave it alone.
+            func isSettled(_ url: URL) -> Bool {
+                let m = (try? url.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate ?? .distantPast
+                return Date().timeIntervalSince(m) > 10
+            }
+            // Intermediates without a sidecar: the app stopped (crash, jetsam) during a two-stage
+            // recording. Adopt them so stage 2 can build the MKV from what reached the flash.
+            for url in items where url.pathExtension == "lci" {
+                let base = url.deletingPathExtension().lastPathComponent
+                if seen.contains(base) || !isSettled(url) { continue }
+                if let r = Self.adoptIntermediate(url: url) { found.append(r); seen.insert(base) }
+            }
+            // Orphan MKVs (imported through Files, an interrupted real-time recording, or a lost sidecar).
             for url in items where url.pathExtension == "mkv" {
                 let base = url.deletingPathExtension().lastPathComponent
-                if seen.contains(base) { continue }
-                if let r = Self.probe(url: url) { found.append(r); seen.insert(base) }
+                if seen.contains(base) || !isSettled(url) { continue }
+                if let r = Self.probe(url: url) {
+                    try? r.save()   // probing can scan a whole unfinalised file; do it once
+                    found.append(r); seen.insert(base)
+                }
             }
             found.sort { $0.createdAt > $1.createdAt }
             DispatchQueue.main.async {
@@ -47,6 +62,45 @@ final class LibraryStore: ObservableObject {
                 self.scanning = false
             }
         }
+    }
+
+    /// Builds the sidecar for an intermediate left behind by an interrupted two-stage recording.
+    static func adoptIntermediate(url: URL) -> Recording? {
+        var err = [CChar](repeating: 0, count: 256)
+        var cfg = LCIntermediateConfig()
+        var pr = LCIntermediateProbe()
+        guard lc_lci_probe(url.path, &cfg, &pr, &err, 256) == 0, pr.video_frames > 0 else { return nil }
+        let base = url.deletingPathExtension().lastPathComponent
+        let attrs = try? FileManager.default.attributesOfItem(atPath: url.path)
+        let created = (attrs?[.creationDate] as? Date) ?? Date()
+        let fps = cfg.fps_den > 0 ? Int((Double(cfg.fps_num) / Double(cfg.fps_den)).rounded()) : 60
+        let timeline = Double(pr.last_video_pts_ns - pr.first_video_pts_ns) / 1e9 + 1.0 / Double(max(fps, 1))
+        let refName = base + "_HEVC.mov"
+        let hasRef = FileManager.default.fileExists(atPath: url.deletingLastPathComponent().appendingPathComponent(refName).path)
+        let audio: Recording.AudioInfo? = cfg.audio_sample_rate > 0 && cfg.audio_channels > 0
+            ? Recording.AudioInfo(sampleRate: Int(cfg.audio_sample_rate), channels: Int(cfg.audio_channels), ambisonic: cfg.audio_ambisonic != 0,
+                                  sourceFormat: "recovered", inexactSamples: 0, trimmedFrames: 0, discontinuities: 0, silenceFramesInserted: 0)
+            : nil
+        let hdr = cfg.color_trc == Int32(LC_COLOR_TRC_ARIB_STD_B67)
+        var r = Recording(baseName: base, createdAt: created, width: Int(cfg.width), height: Int(cfg.height), bitDepth: Int(cfg.bit_depth),
+                          fullRange: cfg.full_range != 0, fps: fps, hdr: hdr,
+                          colorDescription: hdr ? "BT.2020 / HLG (ARIB STD-B67) / BT.2020 NCL" : "BT.709 / BT.709 / BT.709",
+                          pixelFormatFourCC: cfg.bit_depth == 10 ? "x420" : "420v", captureMode: "twoStage",
+                          stage1Codec: String(cString: lc_stage1_codec_name(cfg.codec)),
+                          preset: "—", stabilization: "—", frameCount: pr.video_frames, droppedFrames: 0, sourceDroppedFrames: 0,
+                          durationSeconds: max(timeline, 0), audio: audio,
+                          files: Recording.Files(mkv: nil, hevcReference: hasRef ? refName : nil, hashList: base + ".lchash", intermediate: url.lastPathComponent, thumbnail: nil),
+                          stage2: Recording.Stage2State(status: .pending), verification: Recording.VerificationState(),
+                          referencePath: hasRef ? "recovered" : "none", telemetry: Recording.TelemetrySummary(), lowBitsNonZero: false,
+                          deviceModel: CaptureManager.deviceModelIdentifier(), appVersion: Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "1.0",
+                          notes: "Recovered after the app stopped during recording: \(pr.video_frames) frames reached the intermediate" + (pr.recovered_without_trailer != 0 ? " (chunk table rebuilt by scanning)" : "") + ". Dropped-frame counts from the live session are unknown.")
+        r.contentSeconds = Double(pr.video_frames) / Double(max(fps, 1))
+        r.firstPtsNs = pr.first_video_pts_ns
+        r.lastPtsNs = pr.last_video_pts_ns
+        r.pipelineFailure = "Recording was interrupted (app stopped); recovered from the intermediate"
+        try? r.save()
+        DiagnosticsLog.shared.log("library", "Adopted interrupted recording \(base): \(pr.video_frames) frames")
+        return (try? Recording.load(from: r.sidecarURL)) ?? r
     }
 
     /// Builds minimal metadata for an MKV without a sidecar by probing it.
@@ -82,12 +136,19 @@ final class LibraryStore: ObservableObject {
                           referencePath: "unknown", telemetry: Recording.TelemetrySummary(), lowBitsNonZero: false,
                           deviceModel: "unknown", appVersion: "imported", notes: "Metadata reconstructed by probing the file")
         r.fileSizeBytes = size
+        r.contentSeconds = fps > 0 ? Double(info.frame_count) / Double(fps) : nil
+        if info.finalized == 0 {
+            r.notes = "Metadata reconstructed by probing the file. The file was not finalised (the app stopped while writing it); its frame index was rebuilt by scanning."
+            r.pipelineFailure = "Recording was interrupted (app stopped); the file was not finalised"
+        }
         return r
     }
 
     func delete(_ recording: Recording) {
         let dir = Recording.documentsDirectory()
-        var names: [String] = [recording.baseName + ".json", recording.files.hashList]
+        let b = recording.baseName
+        // By base name as well as by the sidecar's list, so no leftover (e.g. a partial MKV) reappears as an orphan.
+        var names: [String] = [b + ".json", b + ".lchash", b + ".mkv", b + ".lci", b + "_HEVC.mov", recording.files.hashList]
         if let m = recording.files.mkv { names.append(m) }
         if let r = recording.files.hevcReference { names.append(r) }
         if let i = recording.files.intermediate { names.append(i) }
