@@ -205,7 +205,7 @@ BT.709 layer.
 
 | Setting | Options | Notes |
 |---|---|---|
-| Resolution | 1080p / 4K | Greyed "(n/a)" when the camera has no matching format for the current fps/HDR choice. |
+| Resolution | 1080p / 4K | Greyed out and marked "(not offered)" when the camera has no matching format for the current fps/HDR choice (the closest supported format is then used and a warning is shown). |
 | Frame rate | 24 / 30 / 60 | Sets `activeVideoMin/MaxFrameDuration`. |
 | Stabilization | off / standard / cinematic | Applied on the data-output connection (and the reference's connection). Stabilization happens in the ISP before delivery; the stored frames are the stabilized ones. |
 | HDR video | on / off | On = 10-bit 'x420' format with `activeColorSpace = .HLG_BT2020`. Off = the camera's 8-bit 4:2:0 SDR format (stored losslessly as yuv420p, BT.709). |

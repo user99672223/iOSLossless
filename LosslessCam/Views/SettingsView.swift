@@ -73,17 +73,20 @@ struct SettingsView: View {
             let cat = capture.catalog
             Picker("Resolution", selection: s.resolution) {
                 ForEach(Resolution.allCases) { r in
-                    Text(r.rawValue + (cat.isAvailable(resolution: r, fps: settings.settings.frameRate.rawValue, hdr: settings.settings.hdr) ? "" : " (n/a)")).tag(r)
+                    let ok = cat.isAvailable(resolution: r, fps: settings.settings.frameRate.rawValue, hdr: settings.settings.hdr)
+                    Text(r.rawValue + (ok ? "" : " (not offered)")).foregroundStyle(ok ? Color.primary : Color.secondary).tag(r)
                 }
             }
             Picker("Frame rate", selection: s.frameRate) {
                 ForEach(FrameRate.allCases) { f in
-                    Text(f.label + (cat.isAvailable(resolution: settings.settings.resolution, fps: f.rawValue, hdr: settings.settings.hdr) ? "" : " (n/a)")).tag(f)
+                    let ok = cat.isAvailable(resolution: settings.settings.resolution, fps: f.rawValue, hdr: settings.settings.hdr)
+                    Text(f.label + (ok ? "" : " (not offered)")).foregroundStyle(ok ? Color.primary : Color.secondary).tag(f)
                 }
             }
             Picker("Stabilization", selection: s.stabilization) {
                 ForEach(Stabilization.allCases) { st in
-                    Text(st.label + (cat.isStabilizationAvailable(st, resolution: settings.settings.resolution, fps: settings.settings.frameRate.rawValue, hdr: settings.settings.hdr) ? "" : " (n/a)")).tag(st)
+                    let ok = cat.isStabilizationAvailable(st, resolution: settings.settings.resolution, fps: settings.settings.frameRate.rawValue, hdr: settings.settings.hdr)
+                    Text(st.label + (ok ? "" : " (not offered)")).foregroundStyle(ok ? Color.primary : Color.secondary).tag(st)
                 }
             }
             Toggle("HDR video (10-bit HLG BT.2020)", isOn: s.hdr)
