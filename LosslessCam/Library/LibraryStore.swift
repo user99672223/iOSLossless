@@ -40,17 +40,18 @@ final class LibraryStore: ObservableObject {
                 let m = (try? url.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate ?? .distantPast
                 return Date().timeIntervalSince(m) > 10
             }
+            let active = ActiveRecording.shared.baseName
             // Intermediates without a sidecar: the app stopped (crash, jetsam) during a two-stage
             // recording. Adopt them so stage 2 can build the MKV from what reached the flash.
             for url in items where url.pathExtension == "lci" {
                 let base = url.deletingPathExtension().lastPathComponent
-                if seen.contains(base) || !isSettled(url) { continue }
+                if seen.contains(base) || base == active || !isSettled(url) { continue }
                 if let r = Self.adoptIntermediate(url: url) { found.append(r); seen.insert(base) }
             }
             // Orphan MKVs (imported through Files, an interrupted real-time recording, or a lost sidecar).
             for url in items where url.pathExtension == "mkv" {
                 let base = url.deletingPathExtension().lastPathComponent
-                if seen.contains(base) || !isSettled(url) { continue }
+                if seen.contains(base) || base == active || !isSettled(url) { continue }
                 if let r = Self.probe(url: url) {
                     try? r.save()   // probing can scan a whole unfinalised file; do it once
                     found.append(r); seen.insert(base)

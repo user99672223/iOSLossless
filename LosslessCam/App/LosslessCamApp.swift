@@ -62,16 +62,17 @@ struct RootView: View {
             if newState == .recording { tab = 0 }
         }
         .onChange(of: scenePhase) { _, phase in
-            // Jobs interrupted by the background-time limit continue when the app is back.
-            if phase == .active && resumedPending {
-                library.refresh()
-                Stage2Runner.shared.resumePending(recordings: library.recordings, ffv1: settings.settings.ffv1Params, flacLevel: settings.settings.flacCompressionLevel)
-            }
+            // Jobs interrupted by the background-time limit continue when the app is back
+            // (the rescan below resumes them).
+            if phase == .active && resumedPending && !isRecording { library.refresh() }
         }
         .onReceive(library.$scanning) { scanning in
-            // Resume interrupted stage-2 jobs once the first library scan has completed.
-            if !scanning, !resumedPending {
-                resumedPending = true
+            // After every library scan (launch, return to foreground, end of a recording),
+            // resume stage-2 jobs that are pending; resumePending ignores jobs already queued
+            // and does nothing while a recording is in progress.
+            guard !scanning else { return }
+            resumedPending = true
+            if !isRecording {
                 Stage2Runner.shared.resumePending(recordings: library.recordings, ffv1: settings.settings.ffv1Params, flacLevel: settings.settings.flacCompressionLevel)
             }
         }

@@ -47,6 +47,18 @@ struct AudioFormatInfo: Equatable {
     }
 }
 
+/// Base name of the take being recorded right now (thread-safe). The library never
+/// adopts or probes its files, and stage 2 never touches them, until the take is finished.
+final class ActiveRecording {
+    static let shared = ActiveRecording()
+    private let lock = NSLock()
+    private var name: String?
+    var baseName: String? {
+        get { lock.lock(); defer { lock.unlock() }; return name }
+        set { lock.lock(); name = newValue; lock.unlock() }
+    }
+}
+
 /// Orchestrates one recording: ring buffer, worker pool, stage-1 intermediate
 /// or real-time FFV1 writer, audio conversion, hash lists, telemetry and the
 /// sidecar metadata. Hands finished two-stage recordings to `Stage2Runner`.
@@ -100,6 +112,7 @@ final class RecordingPipeline: ObservableObject {
     // MARK: State (guarded by `lock`)
     private let lock = NSLock()
     private var recording = false
+    private var finishing = false
     private var config: Config?
     private var ring: FrameRingBuffer?
     private var writersOpen = false
@@ -172,6 +185,8 @@ final class RecordingPipeline: ObservableObject {
     func start(config: Config) {
         lock.lock()
         self.config = config
+        finishing = false
+        ActiveRecording.shared.baseName = config.baseName
         latestFrameForBenchmark = nil   // never hold a camera pool buffer while recording
         recording = true
         writersOpen = false
@@ -729,7 +744,8 @@ final class RecordingPipeline: ObservableObject {
     /// Drains the ring buffer, closes the writers and produces the sidecar. Call after `endIngest()`.
     func finish(referenceURL: URL?, referenceError: String?, completion: @escaping (Recording?) -> Void) {
         lock.lock()
-        guard let cfg = config else { lock.unlock(); completion(nil); return }
+        guard let cfg = config, !finishing else { lock.unlock(); completion(nil); return }
+        finishing = true
         if recording { lock.unlock(); endIngest(); lock.lock() }
         lock.unlock()
 
@@ -844,11 +860,13 @@ final class RecordingPipeline: ObservableObject {
                 for n in [mkvName, lciName, cfg.baseName + ".lchash"].compactMap({ $0 }) {
                     try? FileManager.default.removeItem(atPath: self.documentsPath(n))
                 }
+                ActiveRecording.shared.baseName = nil
                 DispatchQueue.main.async { self.lastMessage = failure ?? "No frames were recorded" }
                 completion(nil)
                 return
             }
             try? rec.save()
+            ActiveRecording.shared.baseName = nil
             let summary: String
             if dropped > 0 {
                 summary = String(format: "Recorded %lld of %lld frames (%.0f%%) over %.1f s — %lld dropped, pipeline sustained %.1f fps", written, delivered, delivered > 0 ? Double(written) / Double(delivered) * 100 : 0, timelineSeconds, dropped, telemetrySummary.averageFps)

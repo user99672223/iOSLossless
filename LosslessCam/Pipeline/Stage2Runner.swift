@@ -89,7 +89,10 @@ final class Stage2Runner: ObservableObject {
     /// Failed transcodes are left for the manual "Run stage 2 now" button so a corrupt
     /// intermediate does not retry forever at every launch.
     func resumePending(recordings: [Recording], ffv1: LCFfv1Params, flacLevel: Int) {
-        for r in recordings where r.stage2.status == .pending || r.stage2.status == .running {
+        lock.lock(); let paused = pauseRequested; lock.unlock()
+        if paused { return }   // re-run after the recording (the library rescans then)
+        let active = ActiveRecording.shared.baseName
+        for r in recordings where (r.stage2.status == .pending || r.stage2.status == .running) && r.baseName != active {
             if let lci = r.intermediateURL, FileManager.default.fileExists(atPath: lci.path) {
                 if !jobs.contains(where: { $0.baseName == r.baseName && !$0.finished }) {
                     enqueue(recording: r, ffv1: ffv1, flacLevel: flacLevel, metadata: ["LOSSLESSCAM_STAGE2", "resumed"])
@@ -124,10 +127,12 @@ final class Stage2Runner: ObservableObject {
     // MARK: Internals
 
     private func appendJob(_ job: Job) {
-        DispatchQueue.main.async {
+        let apply = {
             self.jobs.removeAll { $0.id == job.id }
             self.jobs.append(job)
         }
+        // Synchronous on main so a second resumePending in the same run loop sees the job.
+        if Thread.isMainThread { apply() } else { DispatchQueue.main.async(execute: apply) }
     }
 
     fileprivate func update(jobID: String, progress: Double, phase: String, error: String? = nil, finished: Bool = false) {
@@ -161,7 +166,8 @@ final class Stage2Runner: ObservableObject {
     /// Background-task identifier shared between the job and its expiration handler.
     private final class TaskBox: @unchecked Sendable {
         var id: UIBackgroundTaskIdentifier = .invalid
-        var expired = false
+        var expired = false     // guarded by Stage2Runner.lock
+        var finished = false    // guarded by Stage2Runner.lock
     }
 
     /// Runs `body` with background execution time. iOS kills an app whose background task outlives
@@ -171,18 +177,30 @@ final class Stage2Runner: ObservableObject {
         let box = TaskBox()
         let begin = {
             box.id = UIApplication.shared.beginBackgroundTask(withName: name) { [weak self] in
-                box.expired = true
-                self?.lock.lock()
-                self?.cancelFlags[baseName]?.pointee = 1
-                self?.lock.unlock()
-                DiagnosticsLog.shared.log("stage2", "\(name) for \(baseName) interrupted: background time expired; resumes when the app is active")
+                var interrupted = false
+                if let self = self {
+                    self.lock.lock()
+                    if !box.finished {
+                        box.expired = true
+                        self.cancelFlags[baseName]?.pointee = 1
+                        interrupted = true
+                    }
+                    self.lock.unlock()
+                }
+                if interrupted {
+                    DiagnosticsLog.shared.log("stage2", "\(name) for \(baseName) interrupted: background time expired; resumes when the app is active")
+                }
                 if box.id != .invalid { UIApplication.shared.endBackgroundTask(box.id); box.id = .invalid }
             }
         }
         if Thread.isMainThread { begin() } else { DispatchQueue.main.sync(execute: begin) }
         let r = body()
+        lock.lock()
+        box.finished = true
+        let expired = box.expired
+        lock.unlock()
         DispatchQueue.main.async { if box.id != .invalid { UIApplication.shared.endBackgroundTask(box.id); box.id = .invalid } }
-        return (r, box.expired)
+        return (r, expired)
     }
 
     private func reload(_ recording: Recording) -> Recording {
@@ -228,6 +246,8 @@ final class Stage2Runner: ObservableObject {
         rec.stage2.intermediateHashMismatches = stats.intermediate_hash_mismatches
         rec.stage2.recoveredWithoutTrailer = stats.recovered_without_trailer != 0
         var renameError: String? = nil
+        // Only a run that actually stopped early counts as interrupted by the background limit.
+        let interrupted = expired && rc != 0
         if rc == 0 && rename(partPath, mkvPath) != 0 {
             renameError = "Could not move the new MKV into place: \(String(cString: strerror(errno)))"
         }
@@ -248,8 +268,8 @@ final class Stage2Runner: ObservableObject {
             update(jobID: jobID, progress: 1, phase: "FFV1/FLAC MKV written in \(String(format: "%.1f", seconds)) s; verifying", finished: true)
             runVerification(recording: rec, jobID: nil, deleteIntermediateOnPass: true)
         } else {
-            let message = renameError ?? (expired ? "Interrupted because the app was in the background; resumes when the app is open" : String(cString: err))
-            rec.stage2.status = expired ? .pending : (flag.pointee == 1 ? .cancelled : .failed)
+            let message = renameError ?? (interrupted ? "Interrupted because the app was in the background; resumes when the app is open" : String(cString: err))
+            rec.stage2.status = interrupted ? .pending : (flag.pointee == 1 ? .cancelled : .failed)
             rec.stage2.error = message
             try? rec.save()
             notifyUpdated()
@@ -282,7 +302,7 @@ final class Stage2Runner: ObservableObject {
             lc_verify_recording(mkv.path, hashPath, 0, progressCallback, Unmanaged.passUnretained(box).toOpaque(), flag, &result, &err, 512)
         }
         rec = reload(rec)
-        if expired {
+        if expired && (rc != 0 || result.status == Int32(LC_VERIFY_CANCELLED.rawValue)) {
             rec.verification = Recording.VerificationState()
             rec.verification.message = "Verification was interrupted because the app was in the background; run it again."
             try? rec.save()

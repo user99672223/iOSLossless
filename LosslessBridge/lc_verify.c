@@ -29,6 +29,11 @@ int lc_verify_recording(const char *mkv_path, const char *hashlist_path, int thr
     double t0 = now_sec();
     int ret = -1;
 
+    if (lc_job_should_stop(cancel)) {
+        r.status = r.video_status = r.audio_status = LC_VERIFY_CANCELLED;
+        if (result) *result = r;
+        return 0;
+    }
     LCHashList *hl = lc_hashlist_load(hashlist_path, err, errlen);
     if (!hl) { if (result) *result = r; return -1; }
     r.frames_expected = hl->video_count;

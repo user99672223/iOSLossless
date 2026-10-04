@@ -91,9 +91,10 @@ final class AudioPlayer {
         cond.lock()
         running = false
         token += 1
+        clockStarted = false
         cond.broadcast()
-        cond.unlock()
         node.stop()
+        cond.unlock()
     }
 
     /// Current playback position derived from the audio hardware clock
@@ -152,13 +153,15 @@ final class AudioPlayer {
             }
             if first {
                 // The node's sample clock starts at play(); starting it only now, with the first
-                // buffer queued, aligns the clock with that buffer's real timestamp.
+                // buffer queued, aligns the clock with that buffer's real timestamp. A loop that
+                // was superseded by stop()/start() must not touch the clock or the node.
                 first = false
                 cond.lock()
+                guard running && token == myToken else { cond.unlock(); return }
                 if pts != Int64.min && pts >= 0 { startPtsNs = pts }
                 clockStarted = true
-                cond.unlock()
                 node.play()
+                cond.unlock()
             }
         }
     }

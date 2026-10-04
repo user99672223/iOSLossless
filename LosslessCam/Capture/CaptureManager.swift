@@ -112,6 +112,9 @@ final class CaptureManager: NSObject, ObservableObject {
     private var configPhase = "idle"
     private var effectiveFps = 60
     private var isRecordingNow = false
+    private var stopInProgress = false
+    /// Foreground state for the crash-loop guard (written on main, read on the session queue).
+    private let appActive = AtomicFlag()
     /// Session-queue copy of the applied format (the @Published one belongs to the main thread).
     private var currentOption: FormatOption?
     private var lastAppliedSignature = ""
@@ -157,8 +160,16 @@ final class CaptureManager: NSObject, ObservableObject {
         observers.append(nc.addObserver(forName: AVCaptureSession.didStopRunningNotification, object: session, queue: nil) { [weak self] _ in
             self?.diagnostics.log("session", "Session stopped running")
         })
-        observers.append(nc.addObserver(forName: UIApplication.willResignActiveNotification, object: nil, queue: nil) { _ in
+        appActive.value = UIApplication.shared.applicationState == .active
+        observers.append(nc.addObserver(forName: UIApplication.didBecomeActiveNotification, object: nil, queue: nil) { [weak self] _ in
+            self?.appActive.value = true
+        })
+        observers.append(nc.addObserver(forName: UIApplication.willResignActiveNotification, object: nil, queue: nil) { [weak self] _ in
             // Leaving the app is not a crash: never let it count towards safe mode.
+            self?.appActive.value = false
+            UserDefaults.standard.set(false, forKey: CaptureManager.inFlightKey)
+        })
+        observers.append(nc.addObserver(forName: UIApplication.didEnterBackgroundNotification, object: nil, queue: nil) { _ in
             UserDefaults.standard.set(false, forKey: CaptureManager.inFlightKey)
         })
     }
@@ -270,7 +281,8 @@ final class CaptureManager: NSObject, ObservableObject {
         }
         diagnostics.log("capture", "Configuring (\(reason)): \(Self.signature(currentSettings)) fallbacks[\(currentFallbacks.summary)]")
         // Crash-loop guard: stays set if the process dies before the session proves stable.
-        UserDefaults.standard.set(true, forKey: Self.inFlightKey)
+        // Only armed in the foreground: a suspended app killed by iOS has not crashed.
+        if appActive.value { UserDefaults.standard.set(true, forKey: Self.inFlightKey) }
         configGeneration += 1
         runtimeErrorsSinceCommit = 0
 
@@ -663,6 +675,8 @@ final class CaptureManager: NSObject, ObservableObject {
         diagnostics.log("session", "Runtime error: \(detail) · running=\(session.isRunning) · \(String(format: "%.1f", CACurrentMediaTime() - lastCommitTime)) s after commit · fallbacks[\(currentFallbacks.summary)]")
         if isRecordingNow {
             // Never tear the graph down under a running recording; the user stops it and we rebuild then.
+            // The configuration was committed and ran, so a later crash is not a setup crash.
+            UserDefaults.standard.set(false, forKey: Self.inFlightKey)
             needsRebuildAfterRecording = true
             publishError("Camera session error while recording: \(DiagnosticsLog.shortLabel(error)). Stop the recording; the session will be rebuilt.")
             return
@@ -902,7 +916,8 @@ final class CaptureManager: NSObject, ObservableObject {
 
     func stopRecording(completion: @escaping (Recording?) -> Void) {
         sessionQueue.async { [self] in
-            guard isRecordingNow else { DispatchQueue.main.async { completion(nil) }; return }
+            guard isRecordingNow, !stopInProgress else { DispatchQueue.main.async { completion(nil) }; return }
+            stopInProgress = true
             DispatchQueue.main.async { self.state = .finishing }
             // Both files end at the same user action: stop lossless ingest first, then the reference.
             pipeline.endIngest()
@@ -916,6 +931,7 @@ final class CaptureManager: NSObject, ObservableObject {
                     Stage2Runner.shared.setPaused(false)
                     self.sessionQueue.async {
                         self.isRecordingNow = false
+                        self.stopInProgress = false
                         AudioSessionState.shared.captureActive = false
                         if self.needsRebuildAfterRecording {
                             self.needsRebuildAfterRecording = false
@@ -982,6 +998,16 @@ extension CaptureManager: AVCaptureVideoDataOutputSampleBufferDelegate, AVCaptur
             }
             pipeline.noteSourceDrop(reason: reason)
         }
+    }
+}
+
+/// Lock-protected Bool shared between the main thread and the session queue.
+final class AtomicFlag {
+    private let lock = NSLock()
+    private var v = false
+    var value: Bool {
+        get { lock.lock(); defer { lock.unlock() }; return v }
+        set { lock.lock(); v = newValue; lock.unlock() }
     }
 }
 

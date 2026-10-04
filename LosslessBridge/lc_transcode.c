@@ -34,6 +34,12 @@ int lc_transcode_intermediate(const char *lci_path, const char *mkv_path,
     int ret = 0;
     char b[64];
 
+    /* A job queued while a recording runs waits here, before touching any file. */
+    if (lc_job_should_stop(cancel)) {
+        lc_set_err(err, errlen, "cancelled");
+        if (stats) *stats = st;
+        return AVERROR_EXIT;
+    }
     LCIReader *r = lci_reader_open(lci_path, err, errlen);
     if (!r) return -1;
     st.recovered_without_trailer = r->recovered;
