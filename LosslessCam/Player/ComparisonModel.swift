@@ -261,28 +261,37 @@ final class ComparisonModel: ObservableObject {
         alignQueue.async { [self] in
             guard let fa = self.a.frame(at: idx) else { DispatchQueue.main.async { self.aligning = false }; return }
             var best: (offset: Int64, psnr: Double) = (base, -1)
+            var anyMeasured = false
             let pts = self.a.pts(ofFrame: idx)
             let centre = self.b.frameIndex(forPts: pts)
             for off in (-range)...range {
                 let ib = centre + off
                 guard ib >= 0, ib < self.infoB.frameCount, let fb = self.b.frame(at: ib) else { continue }
                 var m = LCLumaMetrics()
+                var measuredHere = false
                 CVPixelBufferLockBaseAddress(fa.pixelBuffer, .readOnly); CVPixelBufferLockBaseAddress(fb.pixelBuffer, .readOnly)
                 if let ya = CVPixelBufferGetBaseAddressOfPlane(fa.pixelBuffer, 0), let yb = CVPixelBufferGetBaseAddressOfPlane(fb.pixelBuffer, 0),
                    CVPixelBufferGetWidth(fa.pixelBuffer) == CVPixelBufferGetWidth(fb.pixelBuffer),
                    CVPixelBufferGetPixelFormatType(fa.pixelBuffer) == CVPixelBufferGetPixelFormatType(fb.pixelBuffer) {
                     let bps = self.infoA.bitDepth == 10 ? 2 : 1
-                    _ = lc_luma_metrics(ya.assumingMemoryBound(to: UInt8.self), CVPixelBufferGetBytesPerRowOfPlane(fa.pixelBuffer, 0),
-                                        yb.assumingMemoryBound(to: UInt8.self), CVPixelBufferGetBytesPerRowOfPlane(fb.pixelBuffer, 0),
-                                        Int32(CVPixelBufferGetWidth(fa.pixelBuffer)), Int32(CVPixelBufferGetHeight(fa.pixelBuffer)), Int32(bps), 6,
-                                        Int32(bps == 2 ? 1023 : 255), &m)
+                    measuredHere = lc_luma_metrics(ya.assumingMemoryBound(to: UInt8.self), CVPixelBufferGetBytesPerRowOfPlane(fa.pixelBuffer, 0),
+                                                   yb.assumingMemoryBound(to: UInt8.self), CVPixelBufferGetBytesPerRowOfPlane(fb.pixelBuffer, 0),
+                                                   Int32(CVPixelBufferGetWidth(fa.pixelBuffer)), Int32(CVPixelBufferGetHeight(fa.pixelBuffer)), Int32(bps), 6,
+                                                   Int32(bps == 2 ? 1023 : 255), &m) == 0
                 }
                 CVPixelBufferUnlockBaseAddress(fb.pixelBuffer, .readOnly); CVPixelBufferUnlockBaseAddress(fa.pixelBuffer, .readOnly)
+                guard measuredHere else { continue }
+                anyMeasured = true
                 let p = m.mse == 0 ? 999 : m.psnr
                 if p > best.psnr { best = (off, p) }
             }
+            let measured = anyMeasured
             DispatchQueue.main.async {
                 self.aligning = false
+                guard measured else {
+                    self.statusText = "Auto-align: A and B differ in geometry or pixel format; nothing could be measured"
+                    return
+                }
                 self.statusText = "Auto-align: best offset \(best.offset) frames (PSNR \(best.psnr >= 999 ? "∞" : String(format: "%.2f", best.psnr)) dB)"
                 self.offsetFrames = best.offset
             }

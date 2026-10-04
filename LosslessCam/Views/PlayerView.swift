@@ -112,8 +112,7 @@ private struct PlayerBody: View {
                 if editing {
                     resumeAfterScrub = model.isPlaying
                 } else {
-                    model.seek(to: Int64(scrub))
-                    if resumeAfterScrub { model.play() }
+                    if resumeAfterScrub { model.play(from: Int64(scrub)) } else { model.seek(to: Int64(scrub)) }
                 }
             }
             .onChange(of: scrub) { _, v in if scrubbing { model.seek(to: Int64(v)) } }

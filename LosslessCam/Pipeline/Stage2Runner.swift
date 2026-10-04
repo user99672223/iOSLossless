@@ -80,7 +80,9 @@ final class Stage2Runner: ObservableObject {
     func enqueueVerification(recording: Recording) {
         let job = Job(baseName: recording.baseName, kind: .verify)
         appendJob(job)
-        queue.async { [self] in self.runVerification(recording: recording, jobID: job.id, deleteIntermediateOnPass: false) }
+        // A kept intermediate (stage 2 done, earlier verification not passed) is removed once the MKV verifies.
+        let deleteOnPass = recording.stage2.status == .done
+        queue.async { [self] in self.runVerification(recording: recording, jobID: job.id, deleteIntermediateOnPass: deleteOnPass) }
     }
 
     /// Resume stage 2 for recordings whose intermediate still exists (e.g. after a crash).
@@ -200,7 +202,10 @@ final class Stage2Runner: ObservableObject {
         notifyUpdated()
         update(jobID: jobID, progress: 0, phase: "Starting FFV1 encode")
 
+        // Write to a temporary name: a failed or cancelled rebuild must not destroy an existing MKV.
         let mkvPath = Recording.documentsDirectory().appendingPathComponent(rec.baseName + ".mkv").path
+        let partPath = mkvPath + ".part"
+        try? FileManager.default.removeItem(atPath: partPath)
         let box = ProgressBox(runner: self, jobID: jobID)
         box.sidecarURL = rec.sidecarURL
         let flag = cancelFlag(for: rec.baseName)
@@ -212,7 +217,7 @@ final class Stage2Runner: ObservableObject {
         let checkpoint = Int32(rec.audio?.sampleRate ?? 48000)
         let (rc, expired): (Int32, Bool) = withBackgroundTask("stage2", baseName: rec.baseName) {
             withCStringArray(metadata) { meta in
-                lc_transcode_intermediate(lci.path, mkvPath, &params, Int32(flacLevel), meta,
+                lc_transcode_intermediate(lci.path, partPath, &params, Int32(flacLevel), meta,
                                           hashPath, checkpoint,
                                           progressCallback, Unmanaged.passUnretained(box).toOpaque(), flag, &stats, &err, 512)
             }
@@ -222,7 +227,11 @@ final class Stage2Runner: ObservableObject {
         rec.stage2.seconds = seconds
         rec.stage2.intermediateHashMismatches = stats.intermediate_hash_mismatches
         rec.stage2.recoveredWithoutTrailer = stats.recovered_without_trailer != 0
-        if rc == 0 {
+        var renameError: String? = nil
+        if rc == 0 && rename(partPath, mkvPath) != 0 {
+            renameError = "Could not move the new MKV into place: \(String(cString: strerror(errno)))"
+        }
+        if rc == 0 && renameError == nil {
             rec.stage2.status = .done
             rec.stage2.progress = 1
             rec.files.mkv = rec.baseName + ".mkv"
@@ -239,15 +248,15 @@ final class Stage2Runner: ObservableObject {
             update(jobID: jobID, progress: 1, phase: "FFV1/FLAC MKV written in \(String(format: "%.1f", seconds)) s; verifying", finished: true)
             runVerification(recording: rec, jobID: nil, deleteIntermediateOnPass: true)
         } else {
-            let message = expired ? "Interrupted because the app was in the background; resumes when the app is open" : String(cString: err)
+            let message = renameError ?? (expired ? "Interrupted because the app was in the background; resumes when the app is open" : String(cString: err))
             rec.stage2.status = expired ? .pending : (flag.pointee == 1 ? .cancelled : .failed)
             rec.stage2.error = message
             try? rec.save()
             notifyUpdated()
             DiagnosticsLog.shared.log("stage2", "\(rec.baseName): \(message)")
             update(jobID: jobID, progress: 1, phase: "Stage 2 failed", error: message, finished: true)
-            // Keep the partial MKV out of the library.
-            try? FileManager.default.removeItem(atPath: mkvPath)
+            // Drop the partial output; an MKV from an earlier successful run stays untouched.
+            try? FileManager.default.removeItem(atPath: partPath)
         }
     }
 
@@ -315,7 +324,9 @@ final class Stage2Runner: ObservableObject {
                 rec.files.intermediate = nil
             } else if v.status != .pass {
                 let keep = "Intermediate kept because verification did not pass; use 'Run stage 2 again' to rebuild the MKV."
-                rec.stage2.error = rec.stage2.error.map { $0 + " · " + keep } ?? keep
+                if !(rec.stage2.error ?? "").contains(keep) {
+                    rec.stage2.error = rec.stage2.error.map { $0 + " · " + keep } ?? keep
+                }
             }
         }
         try? rec.save()

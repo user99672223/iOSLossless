@@ -278,8 +278,12 @@ final class RecordingPipeline: ObservableObject {
             lock.unlock()
         } else {
             lock.lock()
-            droppedFrames += 1
-            dropRate.add(1, at: now)
+            if recording {
+                droppedFrames += 1
+                dropRate.add(1, at: now)
+            } else {
+                deliveredFrames -= 1   // raced the stop: not part of the take, not a drop
+            }
             lock.unlock()
         }
     }
@@ -477,7 +481,9 @@ final class RecordingPipeline: ObservableObject {
     /// Stops accepting frames and tells the UI why. Called with `lock` held.
     private func failLocked(_ message: String) {
         recording = false
-        if failure == nil { failure = message }
+        // Every queued frame fails the same way after the first error; report it once.
+        guard failure == nil else { return }
+        failure = message
         notes.append(message)
         DiagnosticsLog.shared.log("pipeline", message)
         DispatchQueue.main.async { self.fatalFailure = message }

@@ -148,7 +148,7 @@ final class LibraryStore: ObservableObject {
         let dir = Recording.documentsDirectory()
         let b = recording.baseName
         // By base name as well as by the sidecar's list, so no leftover (e.g. a partial MKV) reappears as an orphan.
-        var names: [String] = [b + ".json", b + ".lchash", b + ".mkv", b + ".lci", b + "_HEVC.mov", recording.files.hashList]
+        var names: [String] = [b + ".json", b + ".lchash", b + ".mkv", b + ".mkv.part", b + ".lci", b + "_HEVC.mov", recording.files.hashList]
         if let m = recording.files.mkv { names.append(m) }
         if let r = recording.files.hevcReference { names.append(r) }
         if let i = recording.files.intermediate { names.append(i) }

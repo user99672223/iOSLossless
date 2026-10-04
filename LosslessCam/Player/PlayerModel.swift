@@ -138,11 +138,12 @@ final class PlayerModel: ObservableObject {
 
     func togglePlay() { isPlaying ? pause() : play() }
 
-    func play() {
+    func play(from index: Int64? = nil) {
         guard !isPlaying else { return }
         isPlaying = true
         lock.lock(); playToken += 1; let token = playToken; lock.unlock()
-        let startIndex = currentIndex >= frameCount - 1 ? 0 : currentIndex
+        let from = min(max(index ?? currentIndex, 0), frameCount - 1)
+        let startIndex = from >= frameCount - 1 ? 0 : from
         decodeQueue.async { [self] in self.playLoop(token: token, startIndex: startIndex) }
     }
 
