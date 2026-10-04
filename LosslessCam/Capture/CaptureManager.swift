@@ -458,6 +458,9 @@ final class CaptureManager: NSObject, ObservableObject {
                 audioDesc = "No microphone"
             }
         }
+        // Outside FOA only one audio data output may be connected; drop the reference's stereo
+        // output now so that every commit below (including early-return ones) validates.
+        if !appliedFOA { removeReferenceAudioOutput() }
 
         // Lossless video data output (added once).
         configPhase = "video-output"
@@ -754,7 +757,7 @@ final class CaptureManager: NSObject, ObservableObject {
             || m.contains("audiodataoutput") || m.contains("ambisonic")
         if audioRelated {
             // The reference's stereo output is the least valuable part of the audio graph.
-            if appliedReferenceAudioOutput && currentFallbacks.referenceAudio < 1 {
+            if (appliedReferenceAudioOutput || phase == "reference-audio") && currentFallbacks.referenceAudio < 1 {
                 currentFallbacks.referenceAudio = 1
                 return true
             }
@@ -863,6 +866,9 @@ final class CaptureManager: NSObject, ObservableObject {
     /// whether a block is still open (then no new beginConfiguration is issued).
     private func replaceSession(reason: String, configurationOpen: Bool) {
         let old = session
+        // Install the fresh session first: notifications the old one posts while it is emptied and
+        // stopped then fail the identity filter instead of being charged to the current configuration.
+        sessionBox.value = AVCaptureSession()
         videoOutput.setSampleBufferDelegate(nil, queue: nil)
         audioOutput.setSampleBufferDelegate(nil, queue: nil)
         referenceAudioOutput?.setSampleBufferDelegate(nil, queue: nil)
@@ -879,15 +885,14 @@ final class CaptureManager: NSObject, ObservableObject {
                 diagnostics.log("capture", "Stopping the old session raised: \(Self.firstLine(ex))")
             }
         }
-        sessionBox.value = AVCaptureSession()
         videoOutput = AVCaptureVideoDataOutput()
         audioOutput = AVCaptureAudioDataOutput()
         referenceAudioOutput = nil
         videoInput = nil
         audioInput = nil
         inConfiguration = false
-        appliedFOA = false
-        appliedReferenceAudioOutput = false
+        // The applied* flags keep describing the graph that just failed: escalate() and the
+        // recovery ladder read them after a replacement; the next attempt recomputes them.
         reference.detach()
         sessionReplacements += 1
         diagnostics.log("capture", "Capture session replaced (\(reason)); replacement #\(sessionReplacements)")
@@ -922,15 +927,19 @@ final class CaptureManager: NSObject, ObservableObject {
         if error?.domain == AVFoundationErrorDomain && error?.code == -11819 {
             let near = sinceCommit < 10
             if near { mediaResetsNearCommit += 1 }
-            tearDownSessionOnQueue()
             if near && mediaResetsNearCommit >= 2 {
-                if applyNextLadderStep(error: error) {
+                // Choose the step from the graph that failed (inputs and applied flags) before
+                // the teardown discards it.
+                let stepped = applyNextLadderStep(error: error)
+                tearDownSessionOnQueue()
+                if stepped {
                     configureOnQueue(reason: "recovery after repeated media services resets")
                 } else {
                     finishFailed("The camera's media services keep resetting with this configuration. Tap Retry, or change resolution / frame rate / stabilization.")
                 }
                 return
             }
+            tearDownSessionOnQueue()
             publishError("Media services were reset; rebuilding the camera session")
             configureOnQueue(reason: "media services reset")
             return
@@ -968,6 +977,20 @@ final class CaptureManager: NSObject, ObservableObject {
     private func buildLadder() {
         let base = currentFallbacks
         ladderBase = base
+        let spatialReference = appliedReferenceAudioOutput
+        // `referenceAudio` only changes the graph while FOA runs with the reference's second output;
+        // normalising it lets equal graphs compare equal, so no step repeats an earlier one.
+        func normalized(_ f: Fallbacks) -> Fallbacks {
+            var g = f
+            if !spatialReference || g.audio >= 1 { g.referenceAudio = base.referenceAudio }
+            return g
+        }
+        var steps: [(Fallbacks, String)] = []
+        func add(_ f: Fallbacks, _ label: String) {
+            let g = normalized(f)
+            guard g != base, !steps.contains(where: { $0.0 == g }) else { return }
+            steps.append((g, label))
+        }
         var singles: [(Fallbacks, String)] = []
         if appliedReferenceAudioOutput {
             var f = base; f.referenceAudio = 1
@@ -992,7 +1015,7 @@ final class CaptureManager: NSObject, ObservableObject {
                 singles.append((f, "stereo microphone mode disabled"))
             }
         }
-        var steps = singles
+        for s in singles { add(s.0, s.1) }
         if singles.count >= 2 {
             for i in 0..<singles.count {
                 for j in (i + 1)..<singles.count {
@@ -1002,27 +1025,26 @@ final class CaptureManager: NSObject, ObservableObject {
                     f.stabilization = max(f.stabilization, g.stabilization)
                     f.audio = max(f.audio, g.audio)
                     f.referenceAudio = max(f.referenceAudio, g.referenceAudio)
-                    steps.append((f, singles[i].1 + " and " + singles[j].1))
+                    add(f, singles[i].1 + " and " + singles[j].1)
                 }
             }
         }
-        if appliedMovieOutput || appliedStabilization || appliedMultichannel {
-            var f = base
-            if appliedMovieOutput { f.reference = 1 }
-            if appliedStabilization { f.stabilization = 1 }
-            if appliedMultichannel { f.audio = max(f.audio, 2) }
-            f.referenceAudio = 1
-            if !steps.contains(where: { $0.0 == f }) {
-                steps.append((f, "MovieFileOutput, stabilization and multichannel audio all disabled"))
-            }
+        // Everything the graph uses at once (multichannel audio fully off, not just stereo).
+        var suspects: [String] = []
+        var all = base
+        if appliedMovieOutput { all.reference = 1; suspects.append("MovieFileOutput") }
+        if appliedStabilization { all.stabilization = 1; suspects.append("stabilization") }
+        if appliedMultichannel { all.audio = max(all.audio, 2); suspects.append("multichannel audio") }
+        if spatialReference { all.referenceAudio = 1 }
+        if !suspects.isEmpty {
+            add(all, suspects.joined(separator: ", ") + (suspects.count > 1 ? " all disabled" : " disabled"))
         }
         if audioInput != nil {
             var f = base
             if appliedMovieOutput { f.reference = 1 }
             if appliedStabilization { f.stabilization = 1 }
             f.audio = 3
-            f.referenceAudio = 1
-            steps.append((f, "microphone input disabled"))
+            add(f, "microphone input disabled")
         }
         ladder = steps
         ladderIndex = -1
