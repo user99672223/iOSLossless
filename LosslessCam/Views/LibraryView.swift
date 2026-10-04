@@ -193,6 +193,12 @@ struct RecordingDetailView: View {
                     row("Video", "\(v.videoStatus.rawValue) · \(v.framesChecked)/\(v.framesExpected) frames" + (v.firstMismatchFrame >= 0 ? " · first mismatch at frame \(v.firstMismatchFrame)" : ""))
                     row("Audio", "\(v.audioStatus.rawValue) · \(v.audioFramesChecked) sample frames" + (v.audioFirstMismatchFrame >= 0 ? " · mismatch near frame \(v.audioFirstMismatchFrame)" : ""))
                     row("FFV1 slice CRC", v.sliceCrcChecked ? "checked by decoder · \(v.crcErrors) errors" : "not checked")
+                    if let u = v.framesUnverified, u > 0 {
+                        Text("\(u) frames at the end of this interrupted recording have no capture hash and could not be verified; the intermediate is kept.").font(.caption).foregroundStyle(.orange)
+                    }
+                    if let u = r.stage2.framesUnreadable, u > 0 {
+                        Text("\(u) frames at the end of the recovered intermediate were incomplete and are not in the MKV.").font(.caption).foregroundStyle(.orange)
+                    }
                     if let d = v.checkedAt { row("Checked", d.formatted(date: .abbreviated, time: .shortened) + String(format: " (%.1f s)", v.seconds)) }
                     if let m = v.message { Text(m).font(.caption).foregroundStyle(.orange) }
                     Text("Every decoded frame is re-packed to the capture layout and XXH64-hashed; hashes must equal those computed on the frames AVFoundation delivered. Audio is hashed as one continuous 24-bit stream with checkpoints.").font(.caption2).foregroundStyle(.secondary)

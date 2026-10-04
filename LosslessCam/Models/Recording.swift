@@ -35,6 +35,8 @@ struct Recording: Codable, Identifiable, Equatable {
         var seconds: Double = 0
         var intermediateHashMismatches: Int64 = 0
         var recoveredWithoutTrailer: Bool = false
+        /// Recovered intermediate: frames at an undecodable tail that could not be rebuilt.
+        var framesUnreadable: Int64?
     }
 
     enum VerificationStatus: String, Codable { case notRun, running, pass, fail, error, cancelled }
@@ -52,6 +54,8 @@ struct Recording: Codable, Identifiable, Equatable {
         var checkedAt: Date?
         var seconds: Double = 0
         var message: String?
+        /// Interrupted recording: stored frames that have no capture hash (not verifiable).
+        var framesUnverified: Int64?
     }
 
     struct TelemetrySummary: Codable, Equatable {

@@ -184,9 +184,12 @@ int lc_transcode_intermediate(const char *lci_path, const char *mkv_path,
             pkt->pts = e->hdr.index;
             pkt->flags |= AV_PKT_FLAG_KEY;
             ret = avcodec_send_packet(dec, pkt);
-            if (ret < 0) { lc_set_err(err, errlen, "stage-1 decode: %s", lc_averr(ret, b, sizeof(b))); goto done; }
-            ret = avcodec_receive_frame(dec, frame);
-            if (ret < 0) { lc_set_err(err, errlen, "stage-1 decode (no frame): %s", lc_averr(ret, b, sizeof(b))); goto done; }
+            if (ret >= 0) ret = avcodec_receive_frame(dec, frame);
+            if (ret < 0) {
+                if (r->recovered) { st.frames_unreadable = (int64_t)(nv - vi); ret = 0; break; }
+                lc_set_err(err, errlen, "stage-1 decode: %s", lc_averr(ret, b, sizeof(b)));
+                goto done;
+            }
             uint64_t h = lc_hash_planar_as_biplanar(frame->data[0], (size_t)frame->linesize[0],
                                                     frame->data[1], (size_t)frame->linesize[1],
                                                     frame->data[2], (size_t)frame->linesize[2],
@@ -200,11 +203,17 @@ int lc_transcode_intermediate(const char *lci_path, const char *mkv_path,
         } else {
             const uint8_t *src;
             if (e->hdr.flags & LCI_FLAG_STORED || c->codec == LC_S1_RAW) {
-                if (e->hdr.size != packed_size) { ret = -1; lc_set_err(err, errlen, "stored frame has wrong size"); goto done; }
+                if (e->hdr.size != packed_size) {
+                    if (r->recovered) { st.frames_unreadable = (int64_t)(nv - vi); break; }
+                    ret = -1; lc_set_err(err, errlen, "stored frame has wrong size"); goto done;
+                }
                 src = payload;
             } else {
                 size_t n = lc_lz4_decompress(payload, (size_t)e->hdr.size, packed, packed_size, scratch);
-                if (n != packed_size) { ret = -1; lc_set_err(err, errlen, "LZ4 decode failed on frame %lld", (long long)e->hdr.index); goto done; }
+                if (n != packed_size) {
+                    if (r->recovered) { st.frames_unreadable = (int64_t)(nv - vi); break; }
+                    ret = -1; lc_set_err(err, errlen, "LZ4 decode failed on frame %lld", (long long)e->hdr.index); goto done;
+                }
                 src = packed;
             }
             if (c->codec == LC_S1_LZ4_SHUFFLE && bps == 2) {

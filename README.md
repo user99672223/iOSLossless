@@ -205,8 +205,17 @@ If the app is terminated during a recording (crash, jetsam, battery), the
 Library adopts what reached the flash: a two-stage `.lci` intermediate becomes
 a pending recording and stage 2 builds the MKV from it; an unfinalised
 real-time `.mkv` (no Cues, no duration) gets its frame index rebuilt by
-scanning. The capture hash list is flushed every 64 frames, so verification
-checks every frame that has a hash and reports the few at the end that do not.
+scanning. Intermediate chunks are written payload-first, header-last, so a
+crash can never expose a chunk whose data is incomplete; an undecodable tail
+of a recovered intermediate ends the video at the last good frame (counted)
+instead of failing stage 2. The capture hash list is flushed every 64 frames,
+so verification checks every frame that has a hash and reports the few at the
+end that do not; for such recordings the intermediate is kept.
+
+Stage 2 never destroys what is already proven: it writes `<base>.mkv.part`
+and `<base>.lchash.part` and moves both into place only after a complete
+transcode, so a cancelled, failed or interrupted rebuild leaves the previous
+MKV and its hashes untouched.
 
 ---
 

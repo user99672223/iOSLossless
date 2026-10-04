@@ -245,12 +245,19 @@ final class Stage2Runner: ObservableObject {
         rec.stage2.seconds = seconds
         rec.stage2.intermediateHashMismatches = stats.intermediate_hash_mismatches
         rec.stage2.recoveredWithoutTrailer = stats.recovered_without_trailer != 0
+        rec.stage2.framesUnreadable = stats.frames_unreadable > 0 ? stats.frames_unreadable : nil
         var renameError: String? = nil
         // Only a run that actually stopped early counts as interrupted by the background limit.
         let interrupted = expired && rc != 0
         if rc == 0 && rename(partPath, mkvPath) != 0 {
             renameError = "Could not move the new MKV into place: \(String(cString: strerror(errno)))"
         }
+        // The new audio checkpoints were written to <list>.part; they replace the committed ones
+        // only now that the new MKV is in place (identical content for the same intermediate).
+        if rc == 0 && renameError == nil && lc_hashlist_commit_append(hashPath) != 0 {
+            renameError = "Could not update the hash list: \(String(cString: strerror(errno)))"
+        }
+        if rc != 0 || renameError != nil { try? FileManager.default.removeItem(atPath: hashPath + ".part") }
         if rc == 0 && renameError == nil {
             rec.stage2.status = .done
             rec.stage2.progress = 1
@@ -335,15 +342,29 @@ final class Stage2Runner: ObservableObject {
         v.sliceCrcChecked = result.crc_checked != 0
         v.checkedAt = Date()
         v.seconds = result.seconds
-        let msg = String(cString: err)
+        v.framesUnverified = result.frames_unverified > 0 ? result.frames_unverified : nil
+        var msg = String(cString: err)
+        // Stage 2 compared every decoded intermediate frame with its capture hash; a mismatch there
+        // is corruption even when the frame lies beyond the verifiable part of the hash list.
+        if v.status == .pass && rec.stage2.intermediateHashMismatches > 0 {
+            v.status = .fail
+            v.videoStatus = .fail
+            msg = "\(rec.stage2.intermediateHashMismatches) frames did not match their capture hash when the intermediate was decoded"
+        }
         v.message = msg.isEmpty ? nil : msg
         rec.verification = v
+        // The intermediate is the only copy of anything the MKV could not prove: keep it when part of
+        // the take is unverifiable or the file was rebuilt from a crashed intermediate.
+        let fullyProven = v.status == .pass && (v.framesUnverified ?? 0) == 0 && !rec.stage2.recoveredWithoutTrailer
+            && (rec.stage2.framesUnreadable ?? 0) == 0
         if let lci = rec.intermediateURL, FileManager.default.fileExists(atPath: lci.path) {
-            if v.status == .pass && deleteIntermediateOnPass {
+            if fullyProven && deleteIntermediateOnPass {
                 try? FileManager.default.removeItem(at: lci)
                 rec.files.intermediate = nil
-            } else if v.status != .pass {
-                let keep = "Intermediate kept because verification did not pass; use 'Run stage 2 again' to rebuild the MKV."
+            } else if !fullyProven {
+                let keep = v.status == .pass
+                    ? "Intermediate kept: the recording was interrupted, so part of it could not be proven against capture hashes."
+                    : "Intermediate kept because verification did not pass; use 'Run stage 2 again' to rebuild the MKV."
                 if !(rec.stage2.error ?? "").contains(keep) {
                     rec.stage2.error = rec.stage2.error.map { $0 + " · " + keep } ?? keep
                 }

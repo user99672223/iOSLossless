@@ -46,6 +46,14 @@ static void gen_audio(int32_t *buf, int nb, int64_t start_frame)
     }
 }
 
+static void *cancel_later(void *arg)
+{
+    volatile int *ctl = (volatile int *)arg;
+    usleep(30 * 1000);
+    *ctl = 1;
+    return NULL;
+}
+
 static void *resume_later(void *arg)
 {
     volatile int *ctl = (volatile int *)arg;
@@ -134,6 +142,7 @@ static int run_two_stage(LCStage1Codec codec, const char *dir, const char *tag, 
     const char *meta[] = { "LOSSLESSCAM_TEST", "1", NULL };
     int rc = lc_transcode_intermediate(lci, mkv, &p, 5, meta, hashp, 4800, progress, NULL, &cancel, &st, err, sizeof(err));
     CHECK(rc == 0, "transcode (%s): %s", tag, err);
+    CHECK(lc_hashlist_commit_append(hashp) == 0, "commit stage-2 hash records");
     CHECK(st.frames_out == FRAMES, "frames_out=%lld", (long long)st.frames_out);
     CHECK(st.intermediate_hash_mismatches == 0, "intermediate hash mismatches %lld", (long long)st.intermediate_hash_mismatches);
     CHECK(st.audio_trimmed_frames == 200, "trimmed=%lld", (long long)st.audio_trimmed_frames);
@@ -172,8 +181,25 @@ static int run_two_stage(LCStage1Codec codec, const char *dir, const char *tag, 
     {
         rc = lc_transcode_intermediate(lci, mkv, &p, 5, meta, hashp, 4800, progress, NULL, &cancel, &st, err, sizeof(err));
         CHECK(rc == 0, "repeat transcode: %s", err);
-        volatile int stop = 1;
-        rc = lc_transcode_intermediate(lci, mkv, &p, 5, meta, hashp, 4800, progress, NULL, &stop, &st, err, sizeof(err));
+        CHECK(lc_hashlist_commit_append(hashp) == 0, "commit repeat");
+        /* A rebuild cancelled half-way (written to a .part file as the app does) must
+         * leave the existing MKV and its committed hashes verifiable. */
+        char partmkv[600];
+        snprintf(partmkv, sizeof(partmkv), "%s.part", mkv);
+        volatile int stop = 0;
+        pthread_t canceller;
+        CHECK(pthread_create(&canceller, NULL, cancel_later, (void *)&stop) == 0, "thread");
+        rc = lc_transcode_intermediate(lci, partmkv, &p, 5, meta, hashp, 4800, progress, NULL, &stop, &st, err, sizeof(err));
+        pthread_join(canceller, NULL);
+        if (rc == 0) remove(partmkv);   /* finished before the cancel landed: discard like the app would not */
+        char parthash[600];
+        snprintf(parthash, sizeof(parthash), "%s.part", hashp);
+        if (rc != 0) CHECK(access(parthash, F_OK) != 0, "aborted stage 2 left %s behind", parthash);
+        remove(parthash);
+        rc = lc_verify_recording(mkv, hashp, 0, progress, NULL, &cancel, &vr, err, sizeof(err));
+        CHECK(rc == 0 && vr.status == LC_VERIFY_PASS, "verify after a cancelled rebuild: status %d audio %d (%s)", vr.status, vr.audio_status, err);
+        volatile int stop_now = 1;
+        rc = lc_transcode_intermediate(lci, partmkv, &p, 5, meta, hashp, 4800, progress, NULL, &stop_now, &st, err, sizeof(err));
         CHECK(rc != 0, "cancelled transcode returned success");
         volatile int ctl = 2;
         pthread_t th;
@@ -181,6 +207,7 @@ static int run_two_stage(LCStage1Codec codec, const char *dir, const char *tag, 
         rc = lc_transcode_intermediate(lci, mkv, &p, 5, meta, hashp, 4800, progress, NULL, &ctl, &st, err, sizeof(err));
         pthread_join(th, NULL);
         CHECK(rc == 0, "paused-then-resumed transcode: %s", err);
+        CHECK(lc_hashlist_commit_append(hashp) == 0, "commit paused run");
         rc = lc_verify_recording(mkv, hashp, 0, progress, NULL, &cancel, &vr, err, sizeof(err));
         CHECK(rc == 0 && vr.status == LC_VERIFY_PASS, "verify after repeated stage 2: status %d video %d audio %d (%s)",
               vr.status, vr.video_status, vr.audio_status, err);
@@ -377,6 +404,75 @@ static int run_gaps(const char *dir)
     return 0;
 }
 
+/* The app was killed during a two-stage recording: no chunk table, the last chunk
+ * cut short, the capture hash list without its trailer records. */
+static int run_recovered_intermediate(const char *dir)
+{
+    char lci[512], mkv[512], hashp[512], err[256] = {0};
+    snprintf(lci, sizeof(lci), "%s/recovered.lci", dir);
+    snprintf(mkv, sizeof(mkv), "%s/recovered.mkv", dir);
+    snprintf(hashp, sizeof(hashp), "%s/recovered.lchash", dir);
+    const int N = 10;
+    LCIntermediateConfig cfg = {
+        .width = W, .height = H, .bytes_per_sample = 2, .bit_depth = 10,
+        .color_primaries = LC_COLOR_PRI_BT2020, .color_trc = LC_COLOR_TRC_ARIB_STD_B67,
+        .colorspace = LC_COLOR_SPC_BT2020_NCL, .chroma_location = LC_CHROMA_LOC_LEFT,
+        .fps_num = FPS, .fps_den = 1, .codec = LC_S1_LZ4_SHUFFLE,
+        .audio_sample_rate = SR, .audio_channels = CH, .audio_ambisonic = 1,
+    };
+    LCStage1Encoder *enc = lc_s1_encoder_create(&cfg, err, sizeof(err));
+    CHECK(enc, "encoder: %s", err);
+    LCIntermediateWriter *lw = lc_lci_open(lci, &cfg, NULL, 0, err, sizeof(err));
+    CHECK(lw, "lci open: %s", err);
+    LCHashListHeader hh = { .width = W, .height = H, .bit_depth = 10, .fps_num = FPS, .fps_den = 1,
+                            .audio_sample_rate = SR, .audio_channels = CH, .audio_checkpoint_interval = 4800 };
+    LCHashListWriter *hw = lc_hashlist_open(hashp, &hh, err, sizeof(err));
+    CHECK(hw, "hashlist: %s", err);
+    const size_t ys = (size_t)W * 2;
+    uint8_t *y = malloc(ys * H), *c = malloc(ys * (H / 2));
+    int32_t *audio = calloc(800 * CH, sizeof(int32_t));
+    const int64_t frame_ns = 1000000000LL / FPS;
+    for (int i = 0; i < N; i++) {
+        lc_fill_test_frame(y, ys, c, ys, W, H, 2, 700u + (uint32_t)i);
+        uint64_t h = lc_hash_biplanar(y, ys, c, ys, W, H, 2);
+        const uint8_t *out; size_t n;
+        CHECK(lc_s1_encoder_compress(enc, y, ys, c, ys, &out, &n) >= 0, "compress");
+        CHECK(lc_lci_append_video(lw, i, (int64_t)i * frame_ns, h, out, n, (size_t)W * H * 3) == 0, "append");
+        lc_hashlist_add_video(hw, i, (int64_t)i * frame_ns, h);
+        gen_audio(audio, 800, (int64_t)i * 800);
+        CHECK(lc_lci_append_audio(lw, (int64_t)i * 800 * 1000000000LL / SR, audio, 800) == 0, "append audio");
+    }
+    CHECK(lc_lci_close(lw) == 0, "close");
+    lc_hashlist_abort(hw);   /* crash: no 'E'/'F' records */
+    lc_s1_encoder_destroy(enc);
+    free(y); free(c); free(audio);
+
+    /* Simulate the crash: drop the chunk table and cut the file inside the last chunk. */
+    FILE *f = fopen(lci, "rb");
+    CHECK(f, "reopen");
+    fseeko(f, -12, SEEK_END);
+    uint64_t trailer_off = 0;
+    CHECK(fread(&trailer_off, 8, 1, f) == 1, "trailer");
+    fclose(f);
+    /* The last chunk is frame 9's audio (48-byte header + 800 x 4 ch x 4 bytes); cut 1000
+     * bytes further back, i.e. inside frame 9's video payload. */
+    CHECK(truncate(lci, (off_t)trailer_off - (48 + 800 * CH * 4) - 1000) == 0, "truncate");
+
+    LCIntermediateConfig pc; LCIntermediateProbe pr;
+    CHECK(lc_lci_probe(lci, &pc, &pr, err, sizeof(err)) == 0 && pr.recovered_without_trailer, "probe of crashed intermediate: %s", err);
+    LCFfv1Params p = { .level = 3, .coder = 1, .context = 1, .slices = 4, .slicecrc = 1, .threads = 0, .gop = 1 };
+    LCTranscodeStats st; volatile int cancel = 0;
+    int rc = lc_transcode_intermediate(lci, mkv, &p, 5, NULL, hashp, 4800, progress, NULL, &cancel, &st, err, sizeof(err));
+    CHECK(rc == 0, "transcode of a recovered intermediate: %s", err);
+    CHECK(st.recovered_without_trailer && st.frames_out == N - 1, "recovered frames %lld", (long long)st.frames_out);
+    CHECK(lc_hashlist_commit_append(hashp) == 0, "commit");
+    LCVerifyResult vr;
+    CHECK(lc_verify_recording(mkv, hashp, 0, progress, NULL, &cancel, &vr, err, sizeof(err)) == 0 && vr.video_status == LC_VERIFY_PASS,
+          "recovered verify: video %d audio %d (%s)", vr.video_status, vr.audio_status, err);
+    printf("  [recovered] crashed intermediate: %lld of %d frames rebuilt, verify PASS (%s)\n", (long long)st.frames_out, N, err);
+    return 0;
+}
+
 /* The app was killed while the real-time writer was open: no Cues, no trailer. */
 static int run_unfinalised(const char *dir)
 {
@@ -507,6 +603,7 @@ int main(int argc, char **argv)
     /* 9./10. dropped frames and interrupted recordings */
     CHECK(run_gaps(dir) == 0, "gaps");
     CHECK(run_unfinalised(dir) == 0, "unfinalised");
+    CHECK(run_recovered_intermediate(dir) == 0, "recovered intermediate");
 
     /* 11. NaN float input is stored as silence and counted */
     {

@@ -159,7 +159,12 @@ final class RecordingPipeline: ObservableObject {
     private var failure: String?
 
     private var reorder: [Int64: (pts: Int64, hash: UInt64)] = [:]
+    /// Accepted frames that will never be written (failed compression/write): the reorder
+    /// buffer must not wait for them.
+    private var skippedHashIndices = Set<Int64>()
     private var nextHashIndex: Int64 = 0
+    private var firstWrittenPts: Int64 = -1
+    private var lastWrittenPts: Int64 = -1
 
     private var writeRate = RateMeter(window: 2.0)
     private var ingestRate = RateMeter(window: 2.0)
@@ -194,7 +199,8 @@ final class RecordingPipeline: ObservableObject {
         audioBuffers = 0; audioFrames = 0; audioInexact = 0; nextAudioCheckpoint = 48000
         audioFormat = nil; pendingAudio.removeAll(); audioQueue.removeAll()
         audioEnabledForTake = false; lateAudioNoted = false
-        reorder.removeAll(); nextHashIndex = 0
+        reorder.removeAll(); skippedHashIndices.removeAll(); nextHashIndex = 0
+        firstWrittenPts = -1; lastWrittenPts = -1
         lowBits = 0; memoryWarnings = 0; peakFill = 0; fpsSamples.removeAll(); mbpsSamples.removeAll(); maxThermal = 0; notes.removeAll()
         failure = nil
         firstVideoPts = 0; lastVideoPts = 0; firstAcceptedPts = -1; lastAcceptedPts = -1; firstVideoWall = 0; lastBytes = 0
@@ -529,15 +535,35 @@ final class RecordingPipeline: ObservableObject {
                 UnsafePointer(c.assumingMemoryBound(to: UInt8.self)), CVPixelBufferGetBytesPerRowOfPlane(pb, 1))
     }
 
+    /// A frame was written: record its hash (in index order) and its place on the timeline.
     private func recordHash(index: Int64, pts: Int64, hash: UInt64) {
         lock.lock()
         reorder[index] = (pts, hash)
-        while let e = reorder[nextHashIndex] {
-            if let hl = hashList { _ = lc_hashlist_add_video(hl, nextHashIndex, e.pts, e.hash) }
-            reorder.removeValue(forKey: nextHashIndex)
+        if firstWrittenPts < 0 || pts < firstWrittenPts { firstWrittenPts = pts }
+        if pts > lastWrittenPts { lastWrittenPts = pts }
+        advanceHashesLocked()
+        lock.unlock()
+    }
+
+    /// An accepted frame could not be stored: it counts as dropped and the hash list moves past it.
+    private func noteLostFrame(index: Int64) {
+        lock.lock()
+        droppedFrames += 1
+        skippedHashIndices.insert(index)
+        advanceHashesLocked()
+        lock.unlock()
+    }
+
+    private func advanceHashesLocked() {
+        while true {
+            if let e = reorder[nextHashIndex] {
+                if let hl = hashList { _ = lc_hashlist_add_video(hl, nextHashIndex, e.pts, e.hash) }
+                reorder.removeValue(forKey: nextHashIndex)
+            } else if skippedHashIndices.remove(nextHashIndex) == nil {
+                break
+            }
             nextHashIndex += 1
         }
-        lock.unlock()
     }
 
     private func stage1WorkerLoop(index: Int) {
@@ -576,10 +602,14 @@ final class RecordingPipeline: ObservableObject {
                         lock.lock(); writtenFrames += 1; writeRate.add(1, at: CACurrentMediaTime()); lock.unlock()
                     } else {
                         lock.lock(); failLocked("Intermediate write failed at frame \(slot.outputIndex) (storage full?) — recording stopped"); lock.unlock()
+                        noteLostFrame(index: slot.outputIndex)
                     }
                 } else {
-                    lock.lock(); notes.append("Stage-1 compression failed (\(rc)) at frame \(slot.outputIndex)"); lock.unlock()
+                    lock.lock(); if notes.count < 40 { notes.append("Stage-1 compression failed (\(rc)) at frame \(slot.outputIndex)") }; lock.unlock()
+                    noteLostFrame(index: slot.outputIndex)
                 }
+            } else {
+                noteLostFrame(index: slot.outputIndex)
             }
             CVPixelBufferUnlockBaseAddress(pb, .readOnly)
             ring.release(slot)
@@ -626,7 +656,10 @@ final class RecordingPipeline: ObservableObject {
                     lock.lock(); writtenFrames += 1; writeRate.add(1, at: CACurrentMediaTime()); lock.unlock()
                 } else {
                     lock.lock(); failLocked("FFV1 write failed at frame \(slot.outputIndex): \(String(cString: lc_mkv_last_error(mkv))) — recording stopped"); lock.unlock()
+                    noteLostFrame(index: slot.outputIndex)
                 }
+            } else {
+                noteLostFrame(index: slot.outputIndex)
             }
             CVPixelBufferUnlockBaseAddress(pb, .readOnly)
             ring.release(slot)
@@ -664,11 +697,11 @@ final class RecordingPipeline: ObservableObject {
         t.ingestFps = ingestRate.rate(at: now)
         let recentDrops = dropRate.rate(at: now)
         t.recentDropFraction = t.ingestFps > 0.1 ? min(max(recentDrops / t.ingestFps, 0), 1) : 0
-        t.keptFraction = deliveredFrames > 0 ? Double(acceptedFrames) / Double(deliveredFrames) : 1
-        if firstAcceptedPts >= 0 && lastAcceptedPts >= firstAcceptedPts {
-            t.timelineSeconds = Double(lastAcceptedPts - firstAcceptedPts) / 1e9 + 1.0 / Double(max(cfg.fps, 1))
+        t.keptFraction = deliveredFrames > 0 ? Double(deliveredFrames - droppedFrames) / Double(deliveredFrames) : 1
+        if firstWrittenPts >= 0 && lastWrittenPts >= firstWrittenPts {
+            t.timelineSeconds = Double(lastWrittenPts - firstWrittenPts) / 1e9 + 1.0 / Double(max(cfg.fps, 1))
         }
-        t.contentSeconds = Double(acceptedFrames) / Double(max(cfg.fps, 1))
+        t.contentSeconds = Double(writtenFrames) / Double(max(cfg.fps, 1))
         if let r = ring {
             t.bufferCount = r.count
             t.bufferCapacity = r.capacity
@@ -814,8 +847,9 @@ final class RecordingPipeline: ObservableObject {
             let srcDrops = self.sourceDrops
             let fps = Double(max(cfg.fps, 1))
             let contentSeconds = Double(written) / fps
-            let timelineSeconds: Double = (written > 0 && self.firstAcceptedPts >= 0 && self.lastAcceptedPts >= self.firstAcceptedPts)
-                ? Double(self.lastAcceptedPts - self.firstAcceptedPts) / 1e9 + 1.0 / fps
+            // The file spans the frames that were actually written (by presentation time).
+            let timelineSeconds: Double = (written > 0 && self.firstWrittenPts >= 0 && self.lastWrittenPts >= self.firstWrittenPts)
+                ? Double(self.lastWrittenPts - self.firstWrittenPts) / 1e9 + 1.0 / fps
                 : contentSeconds
             var telemetrySummary = Recording.TelemetrySummary()
             telemetrySummary.averageFps = self.fpsSamples.isEmpty ? 0 : self.fpsSamples.reduce(0, +) / Double(self.fpsSamples.count)
@@ -833,8 +867,8 @@ final class RecordingPipeline: ObservableObject {
             if srcDrops > 0 { notes.append("\(srcDrops) frames were dropped by AVFoundation before delivery") }
             let lowBits = self.lowBits
             let failure = self.failure
-            let firstPts = self.firstAcceptedPts
-            let lastPts = self.lastAcceptedPts
+            let firstPts = self.firstWrittenPts
+            let lastPts = self.lastWrittenPts
             self.lock.unlock()
 
             var rec = Recording(

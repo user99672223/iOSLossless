@@ -222,12 +222,16 @@ typedef struct {
 LCHashListWriter *lc_hashlist_open(const char *path, const LCHashListHeader *hdr,
                                    char *err, size_t errlen);
 /**
- * Reopen an existing list to append audio records (two-stage: stage 2 commits
- * the audio). Records left by an earlier, unfinished or repeated stage 2 are
- * removed first, so the list always holds exactly one audio series.
- * lc_hashlist_abort() on such a writer truncates back to the capture-time list.
+ * Prepare the audio records of a (two-stage) stage 2: copies the capture-time
+ * part of the list (without any audio series of an earlier stage 2) to
+ * "<path>.part" and appends there. The committed list is not modified:
+ * lc_hashlist_close_audio() leaves the finished "<path>.part" in place and the
+ * caller renames it over the list with lc_hashlist_commit_append() once the
+ * new MKV has replaced the old one; lc_hashlist_abort() deletes it.
  */
 LCHashListWriter *lc_hashlist_open_append(const char *path, char *err, size_t errlen);
+/** Renames "<path>.part" (written by a successful stage 2) over `path`. */
+int lc_hashlist_commit_append(const char *path);
 /** Writes only the audio totals record ('F') and closes. */
 int lc_hashlist_close_audio(LCHashListWriter *w, int64_t total_audio_frames, uint64_t final_audio_hash);
 int lc_hashlist_add_video(LCHashListWriter *w, int64_t frame_index, int64_t pts_ns, uint64_t hash);
@@ -423,12 +427,18 @@ typedef struct {
     uint16_t low_bits_seen;
     int     recovered_without_trailer;
     int64_t intermediate_hash_mismatches; /* stage-1 payloads whose decoded hash differed from capture */
+    int64_t frames_unreadable;            /* recovered intermediate: frames dropped at an undecodable tail */
 } LCTranscodeStats;
 
 /**
  * When `hashlist_path` is non-NULL the audio stream checkpoints and the final
- * audio hash of the committed FLAC stream are appended to that hash list
- * (every `audio_checkpoint_interval` sample frames, 48000 if <= 0).
+ * audio hash of the committed FLAC stream (every `audio_checkpoint_interval`
+ * sample frames, 48000 if <= 0) are written to "<hashlist_path>.part"; commit
+ * it with lc_hashlist_commit_append() after moving the MKV into place.
+ *
+ * An intermediate recovered after a crash (no chunk table) may end with a
+ * frame whose payload cannot be decoded; stage 2 then ends the video at the
+ * last good frame (counted in frames_unreadable) instead of failing.
  */
 int lc_transcode_intermediate(const char *lci_path, const char *mkv_path,
                               const LCFfv1Params *ffv1, int flac_compression_level,

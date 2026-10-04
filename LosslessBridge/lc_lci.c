@@ -337,9 +337,11 @@ static int append_chunk(LCIntermediateWriter *w, LCIChunkHeader *h, const void *
     w->inflight++;
     pthread_mutex_unlock(&w->mu);
 
+    /* Payload first, header last: after a crash the recovery scan only ever sees
+     * headers whose payload write had already completed. */
     int ret = 0;
-    if (pwrite_all(w->fd, h, sizeof(*h), off) < 0 ||
-        (h->size && pwrite_all(w->fd, payload, (size_t)h->size, off + sizeof(*h)) < 0))
+    if ((h->size && pwrite_all(w->fd, payload, (size_t)h->size, off + sizeof(*h)) < 0) ||
+        pwrite_all(w->fd, h, sizeof(*h), off) < 0)
         ret = -1;
 
     pthread_mutex_lock(&w->mu);

@@ -27,7 +27,8 @@ struct LCHashListWriter {
     int64_t video_count;
     int64_t audio_checkpoints;
     int     append_mode;      /* opened by lc_hashlist_open_append */
-    off_t   append_start;     /* file size before the appended records */
+    off_t   append_start;     /* size of the copied capture-time list */
+    char   *part_path;        /* <list>.part being written (append mode) */
 };
 
 /* Capture-time records are flushed every this many video records so an
@@ -62,42 +63,77 @@ LCHashListWriter *lc_hashlist_open(const char *path, const LCHashListHeader *hdr
 
 LCHashListWriter *lc_hashlist_open_append(const char *path, char *err, size_t errlen)
 {
-    FILE *f = fopen(path, "r+b");
-    if (!f) { lc_set_err(err, errlen, "cannot append to %s: %s", path, strerror(errno)); return NULL; }
+    FILE *src = fopen(path, "rb");
+    if (!src) { lc_set_err(err, errlen, "cannot open %s: %s", path, strerror(errno)); return NULL; }
     char magic[8];
     LCHashListHeader hdr;
-    if (fread(magic, 1, 8, f) != 8 || memcmp(magic, LCHASH_MAGIC, 8) != 0 || fread(&hdr, sizeof(hdr), 1, f) != 1) {
+    if (fread(magic, 1, 8, src) != 8 || memcmp(magic, LCHASH_MAGIC, 8) != 0 || fread(&hdr, sizeof(hdr), 1, src) != 1) {
         lc_set_err(err, errlen, "not a LosslessCam hash list: %s", path);
-        fclose(f);
+        fclose(src);
         return NULL;
     }
     /* The capture-time list ends with its 'E' record and the 'F' record that
-     * follows it; anything after that was appended by an earlier stage 2. */
+     * follows it; anything after that belongs to an earlier stage 2 and is not
+     * copied. The committed list itself is left untouched until the new MKV is
+     * in place (lc_hashlist_commit_append). */
     off_t cut = -1;
     int seen_e = 0;
     LCHashRecord r;
     for (;;) {
-        off_t at = ftello(f);
-        if (fread(&r, sizeof(r), 1, f) != 1) { if (cut < 0) cut = at; break; }
+        off_t at = ftello(src);
+        if (fread(&r, sizeof(r), 1, src) != 1) { if (cut < 0) cut = at; break; }
         if (!seen_e) {
             if (r.type == 'E') seen_e = 1;
         } else if (cut < 0) {
-            cut = (r.type == 'F') ? ftello(f) : at;
+            cut = (r.type == 'F') ? ftello(src) : at;
             break;
         }
     }
-    if (cut < 0) cut = ftello(f);
-    if (ftruncate(fileno(f), cut) != 0 || fseeko(f, cut, SEEK_SET) != 0) {
-        lc_set_err(err, errlen, "cannot reset %s: %s", path, strerror(errno));
-        fclose(f);
+    if (cut < 0) cut = ftello(src);
+    /* A trailing partial record (crash while writing) is not copied either. */
+    const off_t head = 8 + (off_t)sizeof(hdr);
+    if (cut > head) cut = head + ((cut - head) / (off_t)sizeof(LCHashRecord)) * (off_t)sizeof(LCHashRecord);
+
+    size_t plen = strlen(path) + 6;
+    char *part = (char *)malloc(plen);
+    if (!part) { fclose(src); return NULL; }
+    snprintf(part, plen, "%s.part", path);
+    FILE *f = fopen(part, "wb");
+    if (!f) { lc_set_err(err, errlen, "cannot create %s: %s", part, strerror(errno)); free(part); fclose(src); return NULL; }
+    setvbuf(f, NULL, _IOFBF, 1 << 16);
+    int ok = fseeko(src, 0, SEEK_SET) == 0;
+    char buf[1 << 15];
+    off_t left = cut;
+    while (ok && left > 0) {
+        size_t n = (size_t)(left < (off_t)sizeof(buf) ? left : (off_t)sizeof(buf));
+        if (fread(buf, 1, n, src) != n || fwrite(buf, 1, n, f) != n) ok = 0;
+        left -= (off_t)n;
+    }
+    fclose(src);
+    if (!ok) {
+        lc_set_err(err, errlen, "cannot copy %s: %s", path, strerror(errno));
+        fclose(f); remove(part); free(part);
         return NULL;
     }
     LCHashListWriter *w = (LCHashListWriter *)calloc(1, sizeof(*w));
-    if (!w) { fclose(f); return NULL; }
+    if (!w) { fclose(f); remove(part); free(part); return NULL; }
     w->f = f;
     w->append_mode = 1;
     w->append_start = cut;
+    w->part_path = part;
     return w;
+}
+
+int lc_hashlist_commit_append(const char *path)
+{
+    if (!path) return -1;
+    size_t plen = strlen(path) + 6;
+    char *part = (char *)malloc(plen);
+    if (!part) return -1;
+    snprintf(part, plen, "%s.part", path);
+    int ret = rename(part, path) == 0 ? 0 : -1;
+    free(part);
+    return ret;
 }
 
 int lc_hashlist_close_audio(LCHashListWriter *w, int64_t total_audio_frames, uint64_t final_audio_hash)
@@ -106,7 +142,10 @@ int lc_hashlist_close_audio(LCHashListWriter *w, int64_t total_audio_frames, uin
     int ret = 0;
     if (write_record(w->f, 'F', total_audio_frames, 0, final_audio_hash) < 0) ret = -1;
     if (fflush(w->f) != 0) ret = -1;
+    if (fsync(fileno(w->f)) != 0) ret = -1;
     if (fclose(w->f) != 0) ret = -1;
+    if (ret != 0 && w->part_path) remove(w->part_path);
+    free(w->part_path);
     free(w);
     return ret;
 }
@@ -146,12 +185,10 @@ int lc_hashlist_close(LCHashListWriter *w, int64_t total_video_frames, int64_t d
 void lc_hashlist_abort(LCHashListWriter *w)
 {
     if (!w) return;
-    if (w->append_mode) {
-        /* Drop the partial stage-2 series so a retry starts from the capture-time list. */
-        fflush(w->f);
-        if (ftruncate(fileno(w->f), w->append_start) != 0) { /* left as is; the loader keeps only the last series */ }
-    }
     fclose(w->f);
+    /* A failed or cancelled stage 2 leaves the committed list exactly as it was. */
+    if (w->part_path) remove(w->part_path);
+    free(w->part_path);
     free(w);
 }
 
