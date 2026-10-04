@@ -40,7 +40,8 @@ final class CaptureManager: NSObject, ObservableObject {
             }
             if reference == 1 { parts.append("reference: AVAssetWriter (MovieFileOutput removed)") }
             if stabilization == 1 { parts.append("stabilization: off") }
-            if referenceAudio == 1 { parts.append("reference: no stereo audio while spatial audio is captured") }
+            // Only meaningful while spatial audio is still allowed.
+            if referenceAudio == 1 && audio == 0 { parts.append("reference: no stereo audio while spatial audio is captured") }
             return parts.isEmpty ? "none" : parts.joined(separator: " · ")
         }
     }
