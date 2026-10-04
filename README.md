@@ -183,11 +183,16 @@ both:
    default; a format whose frame duration or colour space is rejected is
    skipped for the next best one; white-balance conversions are range-checked.
 2. A runtime error shortly after a configuration change walks a recovery
-   ladder: first the HEVC reference moves from `AVCaptureMovieFileOutput` to
-   the `AVAssetWriter` path (same stabilized frames, so stabilization is kept),
-   then stabilization is turned off, then the audio mode is reduced. Each step
-   is shown in the UI and logged with the AVFoundation error domain, code and
-   underlying error. A configuration that worked is remembered for the session.
+   ladder that removes **one suspect at a time** from what the failing graph
+   actually uses: the in-session HEVC encoder (`AVCaptureMovieFileOutput`,
+   replaced by the `AVAssetWriter` path fed with the same stabilized frames),
+   stabilization, the spatial/stereo microphone mode; then pairs of them, then
+   all, then the microphone input. So a conflict caused by one feature costs
+   only that feature. Each step is shown in the UI and logged with the
+   AVFoundation error domain, code and underlying error. Errors posted for an
+   older configuration are ignored, a late isolated error first restarts the
+   session, an error during a recording applies the next step once the
+   recording stops, and a configuration that ran cleanly is remembered.
 3. If the app ever terminates while configuring the camera, the next launch
    starts in **safe mode** (level 1: no multichannel audio mode and no
    MovieFileOutput; level 2: also no stabilization; level 3: also no

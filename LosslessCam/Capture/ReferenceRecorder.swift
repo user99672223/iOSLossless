@@ -28,10 +28,15 @@ final class ReferenceRecorder: NSObject, AVCaptureFileOutputRecordingDelegate {
     private var droppedByWriter: Int64 = 0
     private var writerSetupError: String?
 
+    // MovieFileOutput hand-off between stop() and the delegate (guarded by `resultLock`): the
+    // output can finish on its own (runtime error, interruption) before stop() is called.
+    private let resultLock = NSLock()
     private var stopCompletion: ((URL?, String?) -> Void)?
+    private var earlyResult: (url: URL?, message: String?)?
     private var movieURL: URL?
     private var active = false
     private var lastMovieError: String?
+    private let hintLock = NSLock()
 
     var pathDescription: String {
         switch path {
@@ -105,6 +110,7 @@ final class ReferenceRecorder: NSObject, AVCaptureFileOutputRecordingDelegate {
         active = true
         droppedByWriter = 0
         lastMovieError = nil
+        resultLock.lock(); earlyResult = nil; stopCompletion = nil; resultLock.unlock()
         switch path {
         case .movieFileOutput:
             movieURL = url
@@ -124,11 +130,23 @@ final class ReferenceRecorder: NSObject, AVCaptureFileOutputRecordingDelegate {
         active = false
         switch path {
         case .movieFileOutput:
+            resultLock.lock()
+            if let r = earlyResult {
+                // The output already finished on its own; deliver what it produced.
+                earlyResult = nil
+                resultLock.unlock()
+                completion(r.url, r.message ?? "MovieFileOutput stopped before the end of the take")
+                return
+            }
             if let out = movieOutput, out.isRecording {
                 stopCompletion = completion
+                resultLock.unlock()
                 out.stopRecording()
             } else {
-                completion(nil, lastMovieError ?? "MovieFileOutput was not recording")
+                resultLock.unlock()
+                // Not recording and no result yet: the file may still exist from a start that failed late.
+                let exists = movieURL.map { FileManager.default.fileExists(atPath: $0.path) } ?? false
+                completion(exists ? movieURL : nil, lastMovieError ?? "MovieFileOutput was not recording")
             }
         case .assetWriter:
             writerQueue.async { self.finishWriter(completion: completion) }
@@ -138,8 +156,6 @@ final class ReferenceRecorder: NSObject, AVCaptureFileOutputRecordingDelegate {
     }
 
     func fileOutput(_ output: AVCaptureFileOutput, didFinishRecordingTo outputFileURL: URL, from connections: [AVCaptureConnection], error: Error?) {
-        let completion = stopCompletion
-        stopCompletion = nil
         var message: String? = nil
         if let error = error as NSError? {
             // A "recording finished successfully" flag accompanies some non-fatal errors.
@@ -147,7 +163,29 @@ final class ReferenceRecorder: NSObject, AVCaptureFileOutputRecordingDelegate {
             DiagnosticsLog.shared.log("reference", "MovieFileOutput finished with \(DiagnosticsLog.describe(error)) successfullyFinished=\(ok)")
             if !ok { message = DiagnosticsLog.shortLabel(error) }
         }
-        completion?(FileManager.default.fileExists(atPath: outputFileURL.path) ? outputFileURL : nil, message)
+        let url: URL? = FileManager.default.fileExists(atPath: outputFileURL.path) ? outputFileURL : nil
+        resultLock.lock()
+        let completion = stopCompletion
+        stopCompletion = nil
+        if completion == nil {
+            // Finished before stop(): keep the result for stop() instead of losing the file.
+            earlyResult = (url, message ?? "MovieFileOutput stopped before the end of the take")
+            lastMovieError = message
+            DiagnosticsLog.shared.log("reference", "MovieFileOutput finished before stop (file kept: \(url != nil))")
+        }
+        resultLock.unlock()
+        completion?(url, message)
+    }
+
+    /// Called for every audio buffer the session delivers (also outside recordings) so the
+    /// AVAssetWriter path knows the current audio format before a take starts.
+    func noteAudioFormat(_ sampleBuffer: CMSampleBuffer) {
+        guard let fd = CMSampleBufferGetFormatDescription(sampleBuffer) else { return }
+        hintLock.lock()
+        if audioFormatHint == nil || !CMFormatDescriptionEqual(audioFormatHint!, otherFormatDescription: fd) {
+            audioFormatHint = fd
+        }
+        hintLock.unlock()
     }
 
     func fileOutput(_ output: AVCaptureFileOutput, didStartRecordingTo fileURL: URL, from connections: [AVCaptureConnection]) {}
@@ -157,9 +195,6 @@ final class ReferenceRecorder: NSObject, AVCaptureFileOutputRecordingDelegate {
     /// Sample buffers are delivered by the pipeline (video + audio data outputs).
     func append(sampleBuffer: CMSampleBuffer, isVideo: Bool) {
         guard path == .assetWriter, active else { return }
-        if !isVideo, audioFormatHint == nil, let fd = CMSampleBufferGetFormatDescription(sampleBuffer) {
-            audioFormatHint = fd
-        }
         writerQueue.async { self.appendOnQueue(sampleBuffer, isVideo: isVideo) }
     }
 
@@ -208,7 +243,10 @@ final class ReferenceRecorder: NSObject, AVCaptureFileOutputRecordingDelegate {
                 w.add(vi)
 
                 var ai: AVAssetWriterInput? = nil
-                if let hint = self.audioFormatHint {
+                self.hintLock.lock()
+                let currentHint = self.audioFormatHint
+                self.hintLock.unlock()
+                if let hint = currentHint {
                     let asbd = CMAudioFormatDescriptionGetStreamBasicDescription(hint)?.pointee
                     let channels = Int(asbd?.mChannelsPerFrame ?? 2)
                     let rate = asbd?.mSampleRate ?? 48000

@@ -10,9 +10,9 @@ import Combine
 /// controls (exposure / white balance / focus), permission handling and —
 /// because AVFoundation reports an impossible configuration either by raising
 /// an Objective-C exception or by posting a runtime error after the fact —
-/// a self-healing recovery ladder that relaxes the configuration step by step
-/// (multichannel audio → MovieFileOutput → stabilization) and reports every
-/// step to the user and to the diagnostics log.
+/// a self-healing recovery ladder that removes one suspect at a time
+/// (in-session HEVC MovieFileOutput, stabilization, multichannel audio), then
+/// combinations, and reports every step to the user and the diagnostics log.
 final class CaptureManager: NSObject, ObservableObject {
     enum State: String { case idle, unauthorized, configuring, running, recording, finishing, interrupted, failed }
 
@@ -121,6 +121,20 @@ final class CaptureManager: NSObject, ObservableObject {
     private var lastConfigureSucceeded = false
     private var needsRebuildAfterRecording = false
     private var pendingSettings: CaptureSettings?
+    /// Configuration generation visible to the notification threads, so a runtime error can be
+    /// attributed to the configuration that was active when it was posted.
+    private let generationBox = AtomicInt()
+    /// Recovery ladder for runtime errors: candidate fallbacks tried one cause at a time, then
+    /// in combination. Rebuilt when the requested settings change.
+    private var ladder: [(Fallbacks, String)] = []
+    private var ladderIndex = -1
+    private var ladderBase = Fallbacks()
+    private var mediaResetsNearCommit = 0
+    private var lateRestartAt: Double = -1000
+    // What the applied configuration actually uses (only these can be causes of a runtime error).
+    private var appliedMovieOutput = false
+    private var appliedStabilization = false
+    private var appliedMultichannel = false
 
     // Video-queue state.
     private var previewRate = RateMeter(window: 1.0)
@@ -148,7 +162,8 @@ final class CaptureManager: NSObject, ObservableObject {
         let nc = NotificationCenter.default
         observers.append(nc.addObserver(forName: AVCaptureSession.runtimeErrorNotification, object: session, queue: nil) { [weak self] n in
             let err = n.userInfo?[AVCaptureSessionErrorKey] as? NSError
-            self?.sessionQueue.async { self?.handleRuntimeError(err) }
+            let gen = self?.generationBox.value ?? 0
+            self?.sessionQueue.async { self?.handleRuntimeError(err, generation: gen) }
         })
         observers.append(nc.addObserver(forName: AVCaptureSession.wasInterruptedNotification, object: session, queue: nil) { [weak self] n in
             let reason = (n.userInfo?[AVCaptureSessionInterruptionReasonKey] as? NSNumber)?.intValue
@@ -228,6 +243,7 @@ final class CaptureManager: NSObject, ObservableObject {
             self.currentSettings = settings
             self.currentFallbacks = self.workingFallbacks[Self.signature(settings)] ?? Fallbacks()
             self.rejectedFormatIDs.removeAll()
+            self.resetLadder()
             self.configureOnQueue(reason: "settings")
         }
     }
@@ -238,6 +254,7 @@ final class CaptureManager: NSObject, ObservableObject {
             self.workingFallbacks.removeAll()
             self.currentFallbacks = Fallbacks()
             self.rejectedFormatIDs.removeAll()
+            self.resetLadder()
             self.tearDownSessionOnQueue()
             self.configureOnQueue(reason: "manual retry")
         }
@@ -252,6 +269,7 @@ final class CaptureManager: NSObject, ObservableObject {
         sessionQueue.async { [self] in
             self.workingFallbacks.removeAll()
             self.currentFallbacks = Fallbacks()
+            self.resetLadder()
             self.tearDownSessionOnQueue()
             self.configureOnQueue(reason: "safe mode reset")
         }
@@ -284,6 +302,7 @@ final class CaptureManager: NSObject, ObservableObject {
         // Only armed in the foreground: a suspended app killed by iOS has not crashed.
         if appActive.value { UserDefaults.standard.set(true, forKey: Self.inFlightKey) }
         configGeneration += 1
+        generationBox.value = configGeneration
         runtimeErrorsSinceCommit = 0
 
         var attempts = 0
@@ -367,6 +386,7 @@ final class CaptureManager: NSObject, ObservableObject {
         configPhase = "audio-input"
         var audioDesc: String
         var info = deviceInfo
+        appliedMultichannel = false
         if !wantAudioInput {
             if let ai = audioInput { session.removeInput(ai); audioInput = nil }
             if session.outputs.contains(audioOutput) { session.removeOutput(audioOutput) }
@@ -381,7 +401,8 @@ final class CaptureManager: NSObject, ObservableObject {
             if let ai = audioInput {
                 configPhase = "audio-mode"
                 let chosen = applyAudioMode(ai, settings: settings, level: audioLevel, info: &info)
-                audioDesc = chosen
+                audioDesc = chosen.label
+                appliedMultichannel = chosen.multichannel
             } else {
                 audioDesc = "No microphone"
             }
@@ -456,12 +477,14 @@ final class CaptureManager: NSObject, ObservableObject {
         // Reference recorder (MovieFileOutput inside the same session when allowed).
         configPhase = "reference"
         reference.configure(session: session, settings: settings, formatOption: option, allowMovieOutput: allowMovieOutput, stabilization: stabMode)
+        appliedMovieOutput = reference.path == .movieFileOutput
+        appliedStabilization = stabMode != .off
 
         configPhase = "commit"
         commitLocked()
 
         configPhase = "controls"
-        applyDeviceControlsOnQueue(settings: settings)
+        applyDeviceControlsOnQueue(settings: settings)   // has its own exception boundary
 
         // Device capability snapshot for the UI (its own exception boundary: a device that
         // is not streaming yet can report white-balance gains the conversion rejects).
@@ -481,6 +504,7 @@ final class CaptureManager: NSObject, ObservableObject {
         info.supportsCustomExposure = device.isExposureModeSupported(.custom)
         info.supportsLockedWB = device.isWhiteBalanceModeSupported(.locked) && device.isLockingWhiteBalanceWithCustomDeviceGainsSupported
         info.supportsLockedFocus = device.isFocusModeSupported(.locked) && device.isLockingFocusWithCustomLensPositionSupported
+        configPhase = "summary"
 
         let stabLabel: String
         if stabMode == .off {
@@ -563,7 +587,7 @@ final class CaptureManager: NSObject, ObservableObject {
 
     /// Applies the best multichannel audio mode allowed at `level`, trying each candidate inside its own
     /// exception boundary so an unsupported mode degrades instead of crashing.
-    private func applyAudioMode(_ ai: AVCaptureDeviceInput, settings: CaptureSettings, level: Int, info: inout DeviceInfo) -> String {
+    private func applyAudioMode(_ ai: AVCaptureDeviceInput, settings: CaptureSettings, level: Int, info: inout DeviceInfo) -> (label: String, multichannel: Bool) {
         info.supportsFOA = ai.isMultichannelAudioModeSupported(.firstOrderAmbisonics)
         info.supportsStereo = ai.isMultichannelAudioModeSupported(.stereo)
         let spatialRequested = settings.audio == .spatial
@@ -585,26 +609,29 @@ final class CaptureManager: NSObject, ObservableObject {
                 diagnostics.log("audio", "multichannelAudioMode=\(c.name) raised \(ex); trying the next mode")
                 continue
             }
-            return c.label
+            return (c.label, c.name != "none")
         }
-        return "Device default"
+        return ("Device default", false)
     }
 
     private func escalate(afterExceptionIn phase: String) -> Bool {
         switch phase {
         case "audio-input", "audio-mode", "audio-output":
-            if currentFallbacks.audio < 3 { currentFallbacks.audio += 1; return true }
+            // Adding or configuring the microphone itself raised: retrying the same steps is pointless.
+            if currentFallbacks.audio < 3 { currentFallbacks.audio = 3; return true }
         case "reference":
             if currentFallbacks.reference < 1 { currentFallbacks.reference = 1; return true }
         case "stabilization":
             if currentFallbacks.stabilization < 1 { currentFallbacks.stabilization = 1; return true }
         case "format", "pixel-format":
             if let id = pendingFormatID, !rejectedFormatIDs.contains(id) { rejectedFormatIDs.insert(id); return true }
-        case "commit", "start", "controls", "snapshot":
-            // Culprit unknown: relax in the order most likely to help.
-            if audioInput != nil && currentFallbacks.audio < 3 { currentFallbacks.audio += 1; return true }
+        case "commit", "start":
+            // Culprit unknown: the in-session HEVC encoder and stabilization are the most demanding
+            // parts of the graph; the microphone goes last.
             if currentFallbacks.reference < 1 { currentFallbacks.reference = 1; return true }
             if currentFallbacks.stabilization < 1 { currentFallbacks.stabilization = 1; return true }
+            if currentFallbacks.audio < 2 { currentFallbacks.audio = 2; return true }
+            if currentFallbacks.audio < 3 { currentFallbacks.audio = 3; return true }
         default:
             break
         }
@@ -668,68 +695,131 @@ final class CaptureManager: NSObject, ObservableObject {
 
     // MARK: Runtime errors and interruptions (session queue)
 
-    private func handleRuntimeError(_ error: NSError?) {
-        runtimeErrorsSinceCommit += 1
-        lastConfigureSucceeded = false
+    private func handleRuntimeError(_ error: NSError?, generation: Int) {
         let detail = DiagnosticsLog.describe(error)
-        diagnostics.log("session", "Runtime error: \(detail) · running=\(session.isRunning) · \(String(format: "%.1f", CACurrentMediaTime() - lastCommitTime)) s after commit · fallbacks[\(currentFallbacks.summary)]")
-        if isRecordingNow {
-            // Never tear the graph down under a running recording; the user stops it and we rebuild then.
-            // The configuration was committed and ran, so a later crash is not a setup crash.
-            UserDefaults.standard.set(false, forKey: Self.inFlightKey)
-            needsRebuildAfterRecording = true
-            publishError("Camera session error while recording: \(DiagnosticsLog.shortLabel(error)). Stop the recording; the session will be rebuilt.")
+        let sinceCommit = CACurrentMediaTime() - lastCommitTime
+        if generation != configGeneration {
+            // Posted for a configuration that has since been replaced (rapid setting changes, or a
+            // second error for a fault the ladder already handled).
+            diagnostics.log("session", "Runtime error from an earlier configuration ignored: \(detail)")
             return
         }
-        // -11819 AVErrorMediaServicesWereReset: the whole capture graph is gone; rebuild it.
+        runtimeErrorsSinceCommit += 1
+        lastConfigureSucceeded = false
+        diagnostics.log("session", "Runtime error: \(detail) · running=\(session.isRunning) · \(String(format: "%.1f", sinceCommit)) s after commit · fallbacks[\(currentFallbacks.summary)]")
+        if isRecordingNow {
+            // Never tear the graph down under a running recording; the user stops it and the next
+            // ladder step is applied then. The configuration was committed and ran, so a later
+            // crash is not a setup crash.
+            UserDefaults.standard.set(false, forKey: Self.inFlightKey)
+            needsRebuildAfterRecording = true
+            publishError("Camera session error while recording: \(DiagnosticsLog.shortLabel(error)). Stop the recording; the session will be rebuilt with a less demanding configuration.")
+            return
+        }
+        // -11819 AVErrorMediaServicesWereReset: the whole capture graph is gone; rebuild it. A reset
+        // right after a configuration, for the second time, is treated like any other recurring error.
         if error?.domain == AVFoundationErrorDomain && error?.code == -11819 {
-            publishError("Media services were reset; rebuilding the camera session")
+            let near = sinceCommit < 10
+            if near { mediaResetsNearCommit += 1 }
             tearDownSessionOnQueue()
+            if near && mediaResetsNearCommit >= 2 {
+                if applyNextLadderStep(error: error) {
+                    configureOnQueue(reason: "recovery after repeated media services resets")
+                } else {
+                    finishFailed("The camera's media services keep resetting with this configuration. Tap Retry, or change resolution / frame rate / stabilization.")
+                }
+                return
+            }
+            publishError("Media services were reset; rebuilding the camera session")
             configureOnQueue(reason: "media services reset")
             return
         }
-        let recent = CACurrentMediaTime() - lastCommitTime < 10
-        if recent || !session.isRunning {
-            if let step = nextRecoveryStep() {
-                currentFallbacks = step.0
-                let message = "\(DiagnosticsLog.shortLabel(error)) → \(step.1)"
-                diagnostics.log("recovery", message)
-                publishError(message)
-                configureOnQueue(reason: "recovery")
-                return
+        let now = CACurrentMediaTime()
+        let recent = sinceCommit < 10 || now - lateRestartAt < 10
+        if !recent {
+            // A late, isolated error: restart once before blaming the configuration.
+            lateRestartAt = now
+            publishError("Camera session error: \(DiagnosticsLog.shortLabel(error)); restarting the session")
+            if !session.isRunning {
+                if let ex = LCCatchObjCException({ self.session.startRunning() }) {
+                    diagnostics.log("session", "startRunning raised \(ex)")
+                }
             }
-            finishFailed("Camera session error: \(DiagnosticsLog.shortLabel(error)). Tap Retry, or change resolution / frame rate / stabilization.")
             return
         }
-        publishError("Camera session error: \(DiagnosticsLog.shortLabel(error))")
-        if !session.isRunning {
-            _ = LCCatchObjCException { self.session.startRunning() }
+        if applyNextLadderStep(error: error) {
+            configureOnQueue(reason: "recovery")
+            return
         }
+        finishFailed("Camera session error: \(DiagnosticsLog.shortLabel(error)). Tap Retry, or change resolution / frame rate / stabilization.")
     }
 
-    /// Next, less demanding configuration to try after a runtime error. Order: keep the user's
-    /// stabilization but move the HEVC reference out of the session, then give up stabilization.
-    private func nextRecoveryStep() -> (Fallbacks, String)? {
-        var f = currentFallbacks
-        let stabWanted = currentSettings.stabilization != .off && f.stabilization == 0
-        if stabWanted && f.reference == 0 {
-            f.reference = 1
-            return (f, "MovieFileOutput removed; HEVC reference now encoded by AVAssetWriter from the same stabilized frames")
+    private func resetLadder() {
+        ladder.removeAll()
+        ladderIndex = -1
+        mediaResetsNearCommit = 0
+        lateRestartAt = -1000
+    }
+
+    /// Builds the ladder from what the failing configuration actually uses: each suspect is first
+    /// removed on its own (so the culprit is found without giving up the others), then in pairs,
+    /// then everything, and finally the microphone input.
+    private func buildLadder() {
+        let base = currentFallbacks
+        ladderBase = base
+        var singles: [(Fallbacks, String)] = []
+        if appliedMovieOutput {
+            var f = base; f.reference = 1
+            singles.append((f, "MovieFileOutput removed; HEVC reference now encoded by AVAssetWriter from the same frames"))
         }
-        if stabWanted {
-            f.stabilization = 1
-            f.reference = currentSettings.referenceRecorder == .assetWriter ? 1 : 0
-            return (f, "video stabilization disabled for this format on this device")
+        if appliedStabilization {
+            var f = base; f.stabilization = 1
+            singles.append((f, "video stabilization disabled for this format on this device"))
         }
-        if f.reference == 0 {
-            f.reference = 1
-            return (f, "MovieFileOutput removed; HEVC reference now encoded by AVAssetWriter")
+        if appliedMultichannel {
+            var f = base; f.audio = max(f.audio, 2)
+            singles.append((f, "spatial/stereo microphone mode disabled"))
         }
-        if audioInput != nil && f.audio < 3 {
-            f.audio += 1
-            return (f, f.audio == 3 ? "microphone input disabled" : "multichannel audio mode reduced")
+        var steps = singles
+        if singles.count >= 2 {
+            for i in 0..<singles.count {
+                for j in (i + 1)..<singles.count {
+                    var f = singles[i].0
+                    let g = singles[j].0
+                    f.reference = max(f.reference, g.reference)
+                    f.stabilization = max(f.stabilization, g.stabilization)
+                    f.audio = max(f.audio, g.audio)
+                    steps.append((f, singles[i].1 + " and " + singles[j].1))
+                }
+            }
         }
-        return nil
+        if singles.count == 3 {
+            var f = base; f.reference = 1; f.stabilization = 1; f.audio = max(f.audio, 2)
+            steps.append((f, "MovieFileOutput, stabilization and multichannel audio all disabled"))
+        }
+        if audioInput != nil {
+            var f = base
+            if appliedMovieOutput { f.reference = 1 }
+            if appliedStabilization { f.stabilization = 1 }
+            f.audio = 3
+            steps.append((f, "microphone input disabled"))
+        }
+        ladder = steps
+        ladderIndex = -1
+    }
+
+    /// Applies the next ladder step; false when the ladder is exhausted.
+    private func applyNextLadderStep(error: NSError?) -> Bool {
+        if ladder.isEmpty || ladderIndex < 0 { buildLadder() }
+        ladderIndex += 1
+        guard ladderIndex < ladder.count else { return false }
+        let step = ladder[ladderIndex]
+        workingFallbacks.removeValue(forKey: Self.signature(currentSettings))
+        currentFallbacks = step.0
+        let message = "\(DiagnosticsLog.shortLabel(error)) → \(step.1) (step \(ladderIndex + 1) of \(ladder.count))"
+        diagnostics.log("recovery", message)
+        publishError(message)
+        return true
     }
 
     private func handleInterruption(_ reasonValue: Int?) {
@@ -766,8 +856,18 @@ final class CaptureManager: NSObject, ObservableObject {
     /// Exposure / white balance / focus can change without reconfiguring the session.
     func applyDeviceControls(settings: CaptureSettings) {
         sessionQueue.async { [self] in
-            self.currentSettings = settings
-            self.applyDeviceControlsOnQueue(settings: settings)
+            // Only the control fields change here; format fields go through configure(settings:).
+            var merged = self.currentSettings
+            merged.exposure = settings.exposure
+            merged.shutterSeconds = settings.shutterSeconds
+            merged.iso = settings.iso
+            merged.whiteBalance = settings.whiteBalance
+            merged.temperature = settings.temperature
+            merged.tint = settings.tint
+            merged.focus = settings.focus
+            merged.lensPosition = settings.lensPosition
+            self.currentSettings = merged
+            self.applyDeviceControlsOnQueue(settings: merged)
         }
     }
 
@@ -779,7 +879,14 @@ final class CaptureManager: NSObject, ObservableObject {
             DispatchQueue.main.async { self.lastError = "Device control: \(error.localizedDescription)" }
             return
         }
-        defer { device.unlockForConfiguration() }
+        // An exception unwinding through Swift would skip a `defer`; unlock explicitly instead.
+        let ex = LCCatchObjCException { self.applyControlsLocked(device, settings: settings) }
+        device.unlockForConfiguration()
+        if let ex = ex { diagnostics.log("controls", "device control raised \(ex)") }
+    }
+
+    /// Called with the device locked for configuration.
+    private func applyControlsLocked(_ device: AVCaptureDevice, settings: CaptureSettings) {
         let f = device.activeFormat
 
         // Exposure
@@ -858,7 +965,7 @@ final class CaptureManager: NSObject, ObservableObject {
 
     func stopRunning() {
         sessionQueue.async { [self] in
-            if self.session.isRunning && self.state != .recording && self.state != .finishing {
+            if self.session.isRunning && !self.isRecordingNow {
                 self.session.stopRunning()
                 DispatchQueue.main.async { if self.state == .running { self.state = .idle } }
             }
@@ -903,6 +1010,7 @@ final class CaptureManager: NSObject, ObservableObject {
             let refURL = Recording.documentsDirectory().appendingPathComponent(base + "_HEVC.mov")
             diagnostics.log("record", "Start \(base) · \(option.width)x\(option.height)@\(effectiveFps) \(option.fourCC) · mode \(settings.captureMode.shortName) · stage1 \(stage1Codec.shortName) · reference \(reference.path.rawValue)")
             isRecordingNow = true
+            UserDefaults.standard.set(false, forKey: Self.inFlightKey)   // a crash from here on is not a setup crash
             AudioSessionState.shared.captureActive = true
             // Stage 2 / verification of earlier takes must not compete with the stage-1 workers.
             Stage2Runner.shared.setPaused(true)
@@ -933,12 +1041,26 @@ final class CaptureManager: NSObject, ObservableObject {
                         self.isRecordingNow = false
                         self.stopInProgress = false
                         AudioSessionState.shared.captureActive = false
+                        let pending = self.pendingSettings
+                        self.pendingSettings = nil
                         if self.needsRebuildAfterRecording {
                             self.needsRebuildAfterRecording = false
+                            if let s = pending, Self.signature(s) != Self.signature(self.currentSettings) {
+                                // The user asked for a different format meanwhile: start from it.
+                                self.currentSettings = s
+                                self.currentFallbacks = self.workingFallbacks[Self.signature(s)] ?? Fallbacks()
+                                self.rejectedFormatIDs.removeAll()
+                                self.resetLadder()
+                            } else {
+                                if let s = pending { self.currentSettings = s }
+                                // The error happened with this graph: do not rebuild it unchanged.
+                                if !self.applyNextLadderStep(error: nil) {
+                                    self.diagnostics.log("recovery", "Ladder exhausted after a recording error; rebuilding as is")
+                                }
+                            }
                             self.tearDownSessionOnQueue()
                             self.configureOnQueue(reason: "rebuild after recording error")
-                        } else if let s = self.pendingSettings {
-                            self.pendingSettings = nil
+                        } else if let s = pending {
                             self.configure(settings: s)
                         }
                     }
@@ -986,6 +1108,7 @@ extension CaptureManager: AVCaptureVideoDataOutputSampleBufferDelegate, AVCaptur
             }
             pipeline.ingestVideo(sampleBuffer)
         } else if output === audioOutput {
+            reference.noteAudioFormat(sampleBuffer)
             pipeline.ingestAudio(sampleBuffer)
         }
     }
@@ -998,6 +1121,16 @@ extension CaptureManager: AVCaptureVideoDataOutputSampleBufferDelegate, AVCaptur
             }
             pipeline.noteSourceDrop(reason: reason)
         }
+    }
+}
+
+/// Lock-protected Int shared between notification threads and the session queue.
+final class AtomicInt {
+    private let lock = NSLock()
+    private var v = 0
+    var value: Int {
+        get { lock.lock(); defer { lock.unlock() }; return v }
+        set { lock.lock(); v = newValue; lock.unlock() }
     }
 }
 
