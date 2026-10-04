@@ -37,6 +37,9 @@ final class ReferenceRecorder: NSObject, AVCaptureFileOutputRecordingDelegate {
     private var active = false
     private var lastMovieError: String?
     private let hintLock = NSLock()
+    /// True while a dedicated stereo audio data output feeds this recorder (the lossless output is
+    /// then first-order ambisonics, which AAC cannot carry). Guarded by `hintLock`.
+    private var dedicatedAudio = false
 
     var pathDescription: String {
         switch path {
@@ -102,6 +105,23 @@ final class ReferenceRecorder: NSObject, AVCaptureFileOutputRecordingDelegate {
     func detach() {
         movieOutput = nil
         path = .off
+        setDedicatedAudio(false)
+    }
+
+    /// Selects where reference audio comes from: the dedicated stereo output (true) or the
+    /// lossless audio output via the pipeline (false). Called on the session queue.
+    func setDedicatedAudio(_ on: Bool) {
+        hintLock.lock()
+        if dedicatedAudio != on {
+            dedicatedAudio = on
+            audioFormatHint = nil   // the other source has a different format
+        }
+        hintLock.unlock()
+    }
+
+    private var usesDedicatedAudio: Bool {
+        hintLock.lock(); defer { hintLock.unlock() }
+        return dedicatedAudio
     }
 
     // MARK: Start / stop
@@ -178,14 +198,22 @@ final class ReferenceRecorder: NSObject, AVCaptureFileOutputRecordingDelegate {
     }
 
     /// Called for every audio buffer the session delivers (also outside recordings) so the
-    /// AVAssetWriter path knows the current audio format before a take starts.
-    func noteAudioFormat(_ sampleBuffer: CMSampleBuffer) {
+    /// AVAssetWriter path knows the current audio format before a take starts. Buffers from the
+    /// source that does not feed the reference are ignored.
+    func noteAudioFormat(_ sampleBuffer: CMSampleBuffer, dedicated: Bool) {
         guard let fd = CMSampleBufferGetFormatDescription(sampleBuffer) else { return }
         hintLock.lock()
-        if audioFormatHint == nil || !CMFormatDescriptionEqual(audioFormatHint!, otherFormatDescription: fd) {
+        if dedicated == dedicatedAudio,
+           audioFormatHint == nil || !CMFormatDescriptionEqual(audioFormatHint!, otherFormatDescription: fd) {
             audioFormatHint = fd
         }
         hintLock.unlock()
+    }
+
+    /// Audio from the dedicated stereo output (see `setDedicatedAudio`).
+    func appendDedicatedAudio(_ sampleBuffer: CMSampleBuffer) {
+        guard path == .assetWriter, active, usesDedicatedAudio else { return }
+        writerQueue.async { self.appendOnQueue(sampleBuffer, isVideo: false) }
     }
 
     func fileOutput(_ output: AVCaptureFileOutput, didStartRecordingTo fileURL: URL, from connections: [AVCaptureConnection]) {}
@@ -195,6 +223,8 @@ final class ReferenceRecorder: NSObject, AVCaptureFileOutputRecordingDelegate {
     /// Sample buffers are delivered by the pipeline (video + audio data outputs).
     func append(sampleBuffer: CMSampleBuffer, isVideo: Bool) {
         guard path == .assetWriter, active else { return }
+        // With a dedicated stereo output, the lossless (FOA) audio is not the reference's source.
+        if !isVideo && usesDedicatedAudio { return }
         writerQueue.async { self.appendOnQueue(sampleBuffer, isVideo: isVideo) }
     }
 
@@ -250,16 +280,23 @@ final class ReferenceRecorder: NSObject, AVCaptureFileOutputRecordingDelegate {
                     let asbd = CMAudioFormatDescriptionGetStreamBasicDescription(hint)?.pointee
                     let channels = Int(asbd?.mChannelsPerFrame ?? 2)
                     let rate = asbd?.mSampleRate ?? 48000
-                    // AAC reference audio is a stereo monitor mix; the lossless file keeps all channels.
-                    let audioSettings: [String: Any] = [
-                        AVFormatIDKey: kAudioFormatMPEG4AAC,
-                        AVSampleRateKey: rate,
-                        AVNumberOfChannelsKey: min(channels, 2),
-                        AVEncoderBitRateKey: 256_000
-                    ]
-                    let input = AVAssetWriterInput(mediaType: .audio, outputSettings: audioSettings, sourceFormatHint: channels > 2 ? nil : hint)
-                    input.expectsMediaDataInRealTime = true
-                    if w.canAdd(input) { w.add(input); ai = input }
+                    if channels > 2 {
+                        // Ambisonic buffers only (no stereo output available): AAC cannot take the
+                        // FOA layout, and an input that never receives samples would leave an empty
+                        // track. The lossless file carries all channels.
+                        DiagnosticsLog.shared.log("reference", "Reference recorded without audio: only \(channels)-channel ambisonic audio is available")
+                    } else {
+                        // AAC reference audio is a stereo monitor mix; the lossless file keeps all channels.
+                        let audioSettings: [String: Any] = [
+                            AVFormatIDKey: kAudioFormatMPEG4AAC,
+                            AVSampleRateKey: rate,
+                            AVNumberOfChannelsKey: channels,
+                            AVEncoderBitRateKey: channels == 1 ? 128_000 : 256_000
+                        ]
+                        let input = AVAssetWriterInput(mediaType: .audio, outputSettings: audioSettings, sourceFormatHint: hint)
+                        input.expectsMediaDataInRealTime = true
+                        if w.canAdd(input) { w.add(input); ai = input }
+                    }
                 }
                 self.writer = w
                 self.videoInput = vi

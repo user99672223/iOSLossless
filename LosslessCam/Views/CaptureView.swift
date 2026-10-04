@@ -9,28 +9,35 @@ final class PreviewUIView: UIView {
     private var coordinator: AVCaptureDevice.RotationCoordinator?
     private var observation: NSKeyValueObservation?
 
+    /// Binds the layer to `session`. The capture manager replaces its session after a failed
+    /// configuration; the new session gets a new preview connection, so the rotation angle is
+    /// re-applied on every call (the coordinator follows the device, which does not change).
     func attach(session: AVCaptureSession) {
         if previewLayer.session !== session { previewLayer.session = session }
         previewLayer.videoGravity = .resizeAspect
         if coordinator == nil, let input = session.inputs.compactMap({ $0 as? AVCaptureDeviceInput }).first(where: { $0.device.hasMediaType(.video) }) {
             let c = AVCaptureDevice.RotationCoordinator(device: input.device, previewLayer: previewLayer)
             coordinator = c
-            if let conn = previewLayer.connection, conn.isVideoRotationAngleSupported(c.videoRotationAngleForHorizonLevelPreview) {
-                conn.videoRotationAngle = c.videoRotationAngleForHorizonLevelPreview
+            observation = c.observe(\.videoRotationAngleForHorizonLevelPreview, options: [.new]) { [weak self] _, _ in
+                DispatchQueue.main.async { self?.applyRotation() }
             }
-            observation = c.observe(\.videoRotationAngleForHorizonLevelPreview, options: [.new]) { [weak self] coord, _ in
-                DispatchQueue.main.async {
-                    if let conn = self?.previewLayer.connection, conn.isVideoRotationAngleSupported(coord.videoRotationAngleForHorizonLevelPreview) {
-                        conn.videoRotationAngle = coord.videoRotationAngleForHorizonLevelPreview
-                    }
-                }
-            }
+        }
+        applyRotation()
+    }
+
+    private func applyRotation() {
+        guard let c = coordinator, let conn = previewLayer.connection else { return }
+        let angle = c.videoRotationAngleForHorizonLevelPreview
+        if conn.videoRotationAngle != angle && conn.isVideoRotationAngleSupported(angle) {
+            conn.videoRotationAngle = angle
         }
     }
 }
 
 struct CameraPreview: UIViewRepresentable {
     let session: AVCaptureSession
+    /// Changes when the capture manager replaces its session (forces `updateUIView`).
+    let sessionVersion: Int
     let inputsVersion: Int
     func makeUIView(context: Context) -> PreviewUIView {
         let v = PreviewUIView()
@@ -77,7 +84,7 @@ struct CaptureView: View {
 
     var body: some View {
         ZStack {
-            CameraPreview(session: capture.session, inputsVersion: capture.session.inputs.count)
+            CameraPreview(session: capture.session, sessionVersion: capture.sessionVersion, inputsVersion: capture.session.inputs.count)
                 .ignoresSafeArea()
             if capture.state == .unauthorized {
                 Color.black.ignoresSafeArea()

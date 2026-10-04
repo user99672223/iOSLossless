@@ -171,6 +171,20 @@ then: verification = decode .mkv, rehash, compare with .lchash → PASS / FAIL
   the app is active again (the `.lci` container has a trailer index and is
   scan-recoverable without it; stage 2 can be re-run any number of times).
 
+### Spatial audio on iOS 26
+
+With `multichannelAudioMode = .firstOrderAmbisonics`, iOS 26 validates every
+connected `AVCaptureAudioDataOutput` at commit: each must set
+`spatialAudioChannelLayoutTag` to `kAudioChannelLayoutTag_HOA_ACN_SN3D | 4`
+(FOA) or `kAudioChannelLayoutTag_Stereo`, at most two outputs may be
+connected (one of each), and in every other mode the tag must stay
+`kAudioChannelLayoutTag_Unknown` with a single output. An untagged output
+makes the commit raise `NSInvalidArgumentException`, which is what terminated
+the app on first launch when the microphone was allowed. LosslessCam tags the
+lossless output FOA and, when the HEVC reference is encoded by
+`AVAssetWriter`, adds a second stereo output that feeds only the reference's
+AAC track. `AVCaptureMovieFileOutput` writes its own FOA + stereo tracks.
+
 ### Session recovery and safe mode
 
 AVFoundation rejects an impossible configuration either by raising an
@@ -182,12 +196,20 @@ both:
    A rejected multichannel audio mode falls back FOA → stereo → device
    default; a format whose frame duration or colour space is rejected is
    skipped for the next best one; white-balance conversions are range-checked.
+   An exception at `commitConfiguration` is attributed from its reason text
+   (an audio-output complaint steps the audio down, it does not switch off
+   stabilization). Because a commit that raises leaves the session inside its
+   configuration block for good (every later `startRunning` raises "may not be
+   called between calls to beginConfiguration and commitConfiguration"), such
+   a session is emptied, stopped and **replaced by a fresh one** with fresh
+   outputs; the preview re-attaches to it.
 2. A runtime error shortly after a configuration change walks a recovery
    ladder that removes **one suspect at a time** from what the failing graph
    actually uses: the in-session HEVC encoder (`AVCaptureMovieFileOutput`,
    replaced by the `AVAssetWriter` path fed with the same stabilized frames),
-   stabilization, the spatial/stereo microphone mode; then pairs of them, then
-   all, then the microphone input. So a conflict caused by one feature costs
+   stabilization, the reference's second stereo audio output, spatial audio
+   (stepped down to stereo) or the stereo microphone mode; then pairs of them,
+   then all, then the microphone input. So a conflict caused by one feature costs
    only that feature. Each step is shown in the UI and logged with the
    AVFoundation error domain, code and underlying error. Errors posted for an
    older configuration are ignored, a late isolated error first restarts the
@@ -448,6 +470,10 @@ LICENSE                 MIT for this code; FFmpeg LGPL-2.1+ and xxHash BSD-2 not
   Settings → Developer → Graphics HUD (the Developer menu exists because
   Developer Mode is enabled for sideloading). Turn it off there. The app also
   sets `MetalHudEnabled = NO` in its Info.plist.
+* **"Camera setup failed in 'start' … between calls to beginConfiguration and
+  commitConfiguration".** Fixed: this followed a rejected commit (on iOS 26,
+  spatial audio without the FOA layout tag). The session is now replaced after
+  such a failure, and the layout tag is set.
 * **The app closed itself when the camera was set up.** Open it again: the
   crash-loop guard starts it in safe mode, and Settings → Diagnostics shows
   which step failed. Share the log (Diagnostics → ⋯ → Share log file) when
@@ -491,9 +517,10 @@ LICENSE                 MIT for this code; FFmpeg LGPL-2.1+ and xxHash BSD-2 not
 * **Simultaneous MovieFileOutput + VideoDataOutput** depends on iOS, the format
   and the stabilization mode; when the session rejects the combination or
   reports a runtime error, the AssetWriter fallback is used and labelled.
-* **AVAssetWriter reference audio** is a stereo AAC monitor track; with spatial
-  (4-channel) capture the fallback reference has no audio (the lossless file
-  keeps all four channels).
+* **AVAssetWriter reference audio** is a stereo AAC monitor track. With spatial
+  capture on iOS 26 it comes from a second, stereo audio data output; on
+  earlier iOS versions, or when the session refuses that output, the
+  reference has no audio (the lossless file keeps all four channels).
 * **The end of an interrupted recording** (about 0.1 s held in the muxer's
   queue, plus frames still in the RAM ring buffer) is lost when the app is
   terminated mid-take.

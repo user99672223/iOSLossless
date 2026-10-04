@@ -24,8 +24,11 @@ final class CaptureManager: NSObject, ObservableObject {
         var reference = 0
         /// 0 = requested stabilization, 1 = stabilization off.
         var stabilization = 0
+        /// 0 = second (stereo) audio data output for the AVAssetWriter reference allowed while the
+        /// lossless output takes first-order ambisonics, 1 = no second output (reference without audio).
+        var referenceAudio = 0
 
-        var isClean: Bool { audio == 0 && reference == 0 && stabilization == 0 }
+        var isClean: Bool { audio == 0 && reference == 0 && stabilization == 0 && referenceAudio == 0 }
 
         var summary: String {
             var parts: [String] = []
@@ -37,13 +40,22 @@ final class CaptureManager: NSObject, ObservableObject {
             }
             if reference == 1 { parts.append("reference: AVAssetWriter (MovieFileOutput removed)") }
             if stabilization == 1 { parts.append("stabilization: off") }
+            if referenceAudio == 1 { parts.append("reference: no stereo audio while spatial audio is captured") }
             return parts.isEmpty ? "none" : parts.joined(separator: " · ")
         }
     }
 
     private enum AttemptResult { case ok, retry, failed(String) }
 
-    let session = AVCaptureSession()
+    /// The live capture session. When the outermost commitConfiguration raises, AVFoundation
+    /// neither applies the changes nor closes the configuration block, so the session stays
+    /// "between beginConfiguration and commitConfiguration" for good and every later
+    /// startRunning raises. Such a session is replaced, never repaired. Readable from any
+    /// thread; replaced only on the session queue (`replaceSession`).
+    private let sessionBox = SessionBox()
+    var session: AVCaptureSession { sessionBox.value }
+    /// Incremented on the main thread whenever `session` is replaced, so the preview re-attaches.
+    @Published private(set) var sessionVersion = 0
     let pipeline = RecordingPipeline()
     let reference = ReferenceRecorder()
     let diagnostics = DiagnosticsLog.shared
@@ -92,13 +104,21 @@ final class CaptureManager: NSObject, ObservableObject {
     private let sessionQueue = DispatchQueue(label: "com.losslesscam.session", qos: .userInitiated)
     private let videoQueue = DispatchQueue(label: "com.losslesscam.video", qos: .userInteractive)
     private let audioQueue = DispatchQueue(label: "com.losslesscam.audio", qos: .userInteractive)
+    private let referenceAudioQueue = DispatchQueue(label: "com.losslesscam.reference-audio", qos: .userInitiated)
 
-    // Session-queue state.
+    // Session-queue state. Outputs belong to one session for life, so they are recreated
+    // together with the session; the sample-buffer delegates never compare against these
+    // references (they are replaced on the session queue while callbacks run elsewhere).
     private var videoDevice: AVCaptureDevice?
     private var videoInput: AVCaptureDeviceInput?
     private var audioInput: AVCaptureDeviceInput?
-    private let videoOutput = AVCaptureVideoDataOutput()
-    private let audioOutput = AVCaptureAudioDataOutput()
+    private var videoOutput = AVCaptureVideoDataOutput()
+    private var audioOutput = AVCaptureAudioDataOutput()
+    /// Stereo audio data output that feeds only the AVAssetWriter reference while `audioOutput`
+    /// delivers first-order ambisonics (iOS 26 allows exactly one FOA and one stereo output then).
+    private var referenceAudioOutput: AVCaptureAudioDataOutput?
+    private lazy var referenceAudioTap = ReferenceAudioTap(reference: reference)
+    private var sessionReplacements = 0
     private var currentSettings = CaptureSettings.default
     private var currentFallbacks = Fallbacks()
     private var rejectedFormatIDs = Set<Int>()
@@ -135,6 +155,8 @@ final class CaptureManager: NSObject, ObservableObject {
     private var appliedMovieOutput = false
     private var appliedStabilization = false
     private var appliedMultichannel = false
+    private var appliedFOA = false
+    private var appliedReferenceAudioOutput = false
 
     // Video-queue state.
     private var previewRate = RateMeter(window: 1.0)
@@ -159,21 +181,27 @@ final class CaptureManager: NSObject, ObservableObject {
 
         pipeline.referenceSink = { [weak self] sb, isVideo in self?.reference.append(sampleBuffer: sb, isVideo: isVideo) }
 
+        // Session notifications are observed for any sender and filtered by identity: the session
+        // object is replaced after a failed commit, and a discarded one must not be reported.
         let nc = NotificationCenter.default
-        observers.append(nc.addObserver(forName: AVCaptureSession.runtimeErrorNotification, object: session, queue: nil) { [weak self] n in
+        observers.append(nc.addObserver(forName: AVCaptureSession.runtimeErrorNotification, object: nil, queue: nil) { [weak self] n in
+            guard let self = self, let sender = n.object as? AVCaptureSession, sender === self.session else { return }
             let err = n.userInfo?[AVCaptureSessionErrorKey] as? NSError
-            let gen = self?.generationBox.value ?? 0
-            self?.sessionQueue.async { self?.handleRuntimeError(err, generation: gen) }
+            let gen = self.generationBox.value
+            self.sessionQueue.async { self.handleRuntimeError(err, generation: gen) }
         })
-        observers.append(nc.addObserver(forName: AVCaptureSession.wasInterruptedNotification, object: session, queue: nil) { [weak self] n in
+        observers.append(nc.addObserver(forName: AVCaptureSession.wasInterruptedNotification, object: nil, queue: nil) { [weak self] n in
+            guard let self = self, let sender = n.object as? AVCaptureSession, sender === self.session else { return }
             let reason = (n.userInfo?[AVCaptureSessionInterruptionReasonKey] as? NSNumber)?.intValue
-            self?.sessionQueue.async { self?.handleInterruption(reason) }
+            self.sessionQueue.async { self.handleInterruption(reason) }
         })
-        observers.append(nc.addObserver(forName: AVCaptureSession.interruptionEndedNotification, object: session, queue: nil) { [weak self] _ in
-            self?.sessionQueue.async { self?.handleInterruptionEnded() }
+        observers.append(nc.addObserver(forName: AVCaptureSession.interruptionEndedNotification, object: nil, queue: nil) { [weak self] n in
+            guard let self = self, let sender = n.object as? AVCaptureSession, sender === self.session else { return }
+            self.sessionQueue.async { self.handleInterruptionEnded() }
         })
-        observers.append(nc.addObserver(forName: AVCaptureSession.didStopRunningNotification, object: session, queue: nil) { [weak self] _ in
-            self?.diagnostics.log("session", "Session stopped running")
+        observers.append(nc.addObserver(forName: AVCaptureSession.didStopRunningNotification, object: nil, queue: nil) { [weak self] n in
+            guard let self = self, let sender = n.object as? AVCaptureSession, sender === self.session else { return }
+            self.diagnostics.log("session", "Session stopped running")
         })
         appActive.value = UIApplication.shared.applicationState == .active
         observers.append(nc.addObserver(forName: UIApplication.didBecomeActiveNotification, object: nil, queue: nil) { [weak self] _ in
@@ -316,16 +344,35 @@ final class CaptureManager: NSObject, ObservableObject {
                 result = self.attemptConfiguration(settings)
             }
             if let ex = exception {
-                diagnostics.log("capture", "Objective-C exception in phase '\(configPhase)': \(ex)")
+                let phase = configPhase
+                diagnostics.log("capture", "Objective-C exception in phase '\(phase)': \(ex)")
+                // The session is unusable when its configuration block cannot be closed: the
+                // outermost commit validates the whole graph, and a commit that raises leaves the
+                // block open, so every later startRunning raises "between beginConfiguration and
+                // commitConfiguration". Try to close it once; if that raises too, replace the session.
+                let stateSymptom = Self.isConfigurationStateException(ex)
+                var poisoned = stateSymptom
                 if inConfiguration {
-                    _ = LCCatchObjCException { self.session.commitConfiguration() }
-                    inConfiguration = false
+                    if let again = LCCatchObjCException({ self.session.commitConfiguration() }) {
+                        diagnostics.log("capture", "Closing the configuration block raised as well: \(Self.firstLine(again))")
+                        poisoned = true
+                    } else {
+                        inConfiguration = false
+                    }
                 }
-                if escalate(afterExceptionIn: configPhase) {
-                    publishError("Camera setup raised an exception in '\(configPhase)'; retrying with \(currentFallbacks.summary)")
+                if poisoned {
+                    replaceSession(reason: "configuration block could not be closed after '\(phase)'", configurationOpen: true)
+                }
+                if stateSymptom {
+                    // Caused by the session state, not by the requested graph: retry it unchanged
+                    // on the fresh session (bounded by the attempt limit).
                     continue
                 }
-                finishFailed("Camera setup failed in '\(configPhase)': \(ex)")
+                if escalate(afterExceptionIn: phase, message: ex) {
+                    publishError("Camera setup: \(Self.firstLine(ex)) — retrying with \(currentFallbacks.summary)")
+                    continue
+                }
+                finishFailed("Camera setup failed in '\(phase)': \(ex)")
                 return
             }
             switch result {
@@ -387,9 +434,12 @@ final class CaptureManager: NSObject, ObservableObject {
         var audioDesc: String
         var info = deviceInfo
         appliedMultichannel = false
+        appliedFOA = false
+        appliedReferenceAudioOutput = false
         if !wantAudioInput {
             if let ai = audioInput { session.removeInput(ai); audioInput = nil }
             if session.outputs.contains(audioOutput) { session.removeOutput(audioOutput) }
+            removeReferenceAudioOutput()
             audioDesc = microphoneAuthorized ? "Microphone input disabled (\(audioLevel >= 3 ? "fallback" : "unavailable"))" : "Microphone not authorized"
         } else {
             if audioInput == nil, let mic = AVCaptureDevice.default(for: .audio) {
@@ -403,6 +453,7 @@ final class CaptureManager: NSObject, ObservableObject {
                 let chosen = applyAudioMode(ai, settings: settings, level: audioLevel, info: &info)
                 audioDesc = chosen.label
                 appliedMultichannel = chosen.multichannel
+                appliedFOA = chosen.foa
             } else {
                 audioDesc = "No microphone"
             }
@@ -421,7 +472,11 @@ final class CaptureManager: NSObject, ObservableObject {
         configPhase = "audio-output"
         if audioInput != nil, !session.outputs.contains(audioOutput) {
             audioOutput.setSampleBufferDelegate(self, queue: audioQueue)
-            if session.canAddOutput(audioOutput) { session.addOutput(audioOutput) }
+            if session.canAddOutput(audioOutput) {
+                session.addOutput(audioOutput)
+            } else {
+                diagnostics.log("audio", "Session refused the audio data output (canAddOutput == false); recording without audio")
+            }
         }
 
         // Format, frame rate, colour space.
@@ -479,6 +534,15 @@ final class CaptureManager: NSObject, ObservableObject {
         reference.configure(session: session, settings: settings, formatOption: option, allowMovieOutput: allowMovieOutput, stabilization: stabMode)
         appliedMovieOutput = reference.path == .movieFileOutput
         appliedStabilization = stabMode != .off
+
+        // While the lossless output takes 4-channel ambisonics, the AVAssetWriter reference gets
+        // its own stereo output (AAC cannot carry the FOA layout). MovieFileOutput records its
+        // own FOA + stereo tracks and needs none.
+        configPhase = "reference-audio"
+        configureReferenceAudioOutput(wanted: appliedFOA && audioInput != nil && reference.path == .assetWriter && currentFallbacks.referenceAudio == 0)
+        if appliedFOA && reference.path == .assetWriter && !appliedReferenceAudioOutput {
+            audioDesc += " · HEVC reference without audio"
+        }
 
         configPhase = "commit"
         commitLocked()
@@ -587,38 +651,131 @@ final class CaptureManager: NSObject, ObservableObject {
 
     /// Applies the best multichannel audio mode allowed at `level`, trying each candidate inside its own
     /// exception boundary so an unsupported mode degrades instead of crashing.
-    private func applyAudioMode(_ ai: AVCaptureDeviceInput, settings: CaptureSettings, level: Int, info: inout DeviceInfo) -> (label: String, multichannel: Bool) {
+    ///
+    /// iOS 26 validates the audio data outputs against the mode at commit (AVCaptureAudioDataOutput.h):
+    /// with first-order ambisonics every connected audio data output needs a spatial layout tag
+    /// (`kAudioChannelLayoutTag_HOA_ACN_SN3D | 4` or `kAudioChannelLayoutTag_Stereo`), with any other
+    /// mode the tag must stay `kAudioChannelLayoutTag_Unknown`. An untagged output in FOA mode makes the
+    /// commit raise NSInvalidArgumentException. Each candidate therefore sets mode and tag together.
+    private func applyAudioMode(_ ai: AVCaptureDeviceInput, settings: CaptureSettings, level: Int, info: inout DeviceInfo) -> (label: String, multichannel: Bool, foa: Bool) {
         info.supportsFOA = ai.isMultichannelAudioModeSupported(.firstOrderAmbisonics)
         info.supportsStereo = ai.isMultichannelAudioModeSupported(.stereo)
         let spatialRequested = settings.audio == .spatial
+        let output = audioOutput
         var candidates: [(name: String, apply: () -> Void, label: String)] = []
         if level == 0 && spatialRequested && info.supportsFOA {
-            candidates.append(("firstOrderAmbisonics", { ai.multichannelAudioMode = .firstOrderAmbisonics }, "First-order ambisonics (4 ch)"))
+            candidates.append(("firstOrderAmbisonics", {
+                ai.multichannelAudioMode = .firstOrderAmbisonics
+                if #available(iOS 26.0, *) {
+                    output.spatialAudioChannelLayoutTag = kAudioChannelLayoutTag_HOA_ACN_SN3D | 4
+                }
+            }, "First-order ambisonics (4 ch, ACN/SN3D)"))
         }
         if level <= 1 && info.supportsStereo {
             let label: String
             if !spatialRequested { label = "Stereo" }
             else if level > 0 { label = "Stereo (spatial disabled by fallback)" }
             else { label = info.supportsFOA ? "Stereo (FOA mode was rejected)" : "Stereo (FOA unsupported on this device)" }
-            candidates.append(("stereo", { ai.multichannelAudioMode = .stereo }, label))
+            candidates.append(("stereo", {
+                ai.multichannelAudioMode = .stereo
+                if #available(iOS 26.0, *) {
+                    output.spatialAudioChannelLayoutTag = kAudioChannelLayoutTag_Unknown
+                }
+            }, label))
         }
-        candidates.append(("none", { ai.multichannelAudioMode = .none },
-                           level >= 2 ? "Device default (multichannel modes disabled by fallback)" : "Device default (mono)"))
+        candidates.append(("none", {
+            ai.multichannelAudioMode = .none
+            if #available(iOS 26.0, *) {
+                output.spatialAudioChannelLayoutTag = kAudioChannelLayoutTag_Unknown
+            }
+        }, level >= 2 ? "Device default (multichannel modes disabled by fallback)" : "Device default (mono)"))
         for c in candidates {
             if let ex = LCCatchObjCException(c.apply) {
                 diagnostics.log("audio", "multichannelAudioMode=\(c.name) raised \(ex); trying the next mode")
                 continue
             }
-            return (c.label, c.name != "none")
+            diagnostics.log("audio", "multichannelAudioMode=\(c.name)\(Self.layoutTagNote(output))")
+            return (c.label, c.name != "none", c.name == "firstOrderAmbisonics")
         }
-        return ("Device default", false)
+        return ("Device default", false, false)
     }
 
-    private func escalate(afterExceptionIn phase: String) -> Bool {
+    private static func layoutTagNote(_ output: AVCaptureAudioDataOutput) -> String {
+        if #available(iOS 26.0, *) {
+            return String(format: " · output layout tag 0x%08X", output.spatialAudioChannelLayoutTag)
+        }
+        return ""
+    }
+
+    /// Adds or removes the stereo audio data output that feeds the AVAssetWriter reference while
+    /// the lossless output takes first-order ambisonics. Runs inside the configuration block.
+    private func configureReferenceAudioOutput(wanted: Bool) {
+        if #available(iOS 26.0, *), wanted {
+            let out = referenceAudioOutput ?? AVCaptureAudioDataOutput()
+            out.spatialAudioChannelLayoutTag = kAudioChannelLayoutTag_Stereo
+            if session.outputs.contains(out) {
+                appliedReferenceAudioOutput = true
+            } else {
+                out.setSampleBufferDelegate(referenceAudioTap, queue: referenceAudioQueue)
+                if session.canAddOutput(out) {
+                    session.addOutput(out)
+                    referenceAudioOutput = out
+                    appliedReferenceAudioOutput = true
+                } else {
+                    out.setSampleBufferDelegate(nil, queue: nil)
+                    referenceAudioOutput = nil
+                    diagnostics.log("audio", "Session refused a second (stereo) audio data output; the HEVC reference records without audio")
+                }
+            }
+        } else {
+            removeReferenceAudioOutput()
+        }
+        reference.setDedicatedAudio(appliedReferenceAudioOutput)
+    }
+
+    private func removeReferenceAudioOutput() {
+        if let out = referenceAudioOutput {
+            if session.outputs.contains(out) { session.removeOutput(out) }
+            out.setSampleBufferDelegate(nil, queue: nil)
+            referenceAudioOutput = nil
+        }
+        appliedReferenceAudioOutput = false
+        reference.setDedicatedAudio(false)
+    }
+
+    /// Picks the fallback that addresses the exception. AVFoundation names the offending object in
+    /// the reason (e.g. "multichannelAudioMode … AVCaptureAudioDataOutput spatialAudioChannelLayoutTag"),
+    /// so the message decides before the phase does; this keeps an audio fault from switching off
+    /// stabilization or the in-session HEVC encoder.
+    private func escalate(afterExceptionIn phase: String, message: String) -> Bool {
+        let m = message.lowercased()
+        let audioRelated = phase.hasPrefix("audio") || phase == "reference-audio"
+            || m.contains("multichannelaudiomode") || m.contains("spatialaudiochannellayouttag")
+            || m.contains("audiodataoutput") || m.contains("ambisonic")
+        if audioRelated {
+            // The reference's stereo output is the least valuable part of the audio graph.
+            if appliedReferenceAudioOutput && currentFallbacks.referenceAudio < 1 {
+                currentFallbacks.referenceAudio = 1
+                return true
+            }
+            if phase == "audio-input" {
+                // Adding the microphone itself raised: no audio mode can help.
+                if currentFallbacks.audio < 3 { currentFallbacks.audio = 3; return true }
+                return false
+            }
+            // One step at a time: FOA → stereo → no multichannel mode → no microphone.
+            if currentFallbacks.audio < 3 { currentFallbacks.audio += 1; return true }
+            return false
+        }
+        if m.contains("stabiliz") && currentFallbacks.stabilization < 1 {
+            currentFallbacks.stabilization = 1
+            return true
+        }
+        if m.contains("moviefileoutput") && currentFallbacks.reference < 1 {
+            currentFallbacks.reference = 1
+            return true
+        }
         switch phase {
-        case "audio-input", "audio-mode", "audio-output":
-            // Adding or configuring the microphone itself raised: retrying the same steps is pointless.
-            if currentFallbacks.audio < 3 { currentFallbacks.audio = 3; return true }
         case "reference":
             if currentFallbacks.reference < 1 { currentFallbacks.reference = 1; return true }
         case "stabilization":
@@ -626,16 +783,27 @@ final class CaptureManager: NSObject, ObservableObject {
         case "format", "pixel-format":
             if let id = pendingFormatID, !rejectedFormatIDs.contains(id) { rejectedFormatIDs.insert(id); return true }
         case "commit", "start":
-            // Culprit unknown: the in-session HEVC encoder and stabilization are the most demanding
-            // parts of the graph; the microphone goes last.
+            // Culprit not named: the in-session HEVC encoder and stabilization are the most demanding
+            // parts of the graph; the microphone goes last, one audio step at a time.
             if currentFallbacks.reference < 1 { currentFallbacks.reference = 1; return true }
             if currentFallbacks.stabilization < 1 { currentFallbacks.stabilization = 1; return true }
-            if currentFallbacks.audio < 2 { currentFallbacks.audio = 2; return true }
-            if currentFallbacks.audio < 3 { currentFallbacks.audio = 3; return true }
+            if currentFallbacks.referenceAudio < 1 && appliedReferenceAudioOutput { currentFallbacks.referenceAudio = 1; return true }
+            if currentFallbacks.audio < 3 { currentFallbacks.audio += 1; return true }
         default:
             break
         }
         return false
+    }
+
+    /// The NSGenericException AVFoundation raises when startRunning/stopRunning is called while a
+    /// configuration block is still open: a symptom of the session's state, not of the graph.
+    static func isConfigurationStateException(_ message: String) -> Bool {
+        message.contains("beginConfiguration") && message.contains("commitConfiguration")
+    }
+
+    static func firstLine(_ message: String) -> String {
+        let line = message.split(separator: "\n", maxSplits: 1).first.map(String.init) ?? message
+        return line.count > 220 ? String(line.prefix(220)) + "…" : line
     }
 
     private func finishConfigured() {
@@ -680,17 +848,50 @@ final class CaptureManager: NSObject, ObservableObject {
         DispatchQueue.main.async { self.lastError = message }
     }
 
+    /// Full teardown before a rebuild (retry, safe-mode reset, media services reset, recovery
+    /// after a recording error): a fresh session carries no state from the failed one.
     private func tearDownSessionOnQueue() {
-        _ = LCCatchObjCException {
-            self.session.beginConfiguration()
-            for o in self.session.outputs { self.session.removeOutput(o) }
-            for i in self.session.inputs { self.session.removeInput(i) }
-            self.session.commitConfiguration()
+        replaceSession(reason: "rebuild", configurationOpen: inConfiguration)
+    }
+
+    /// Retires the current session and installs a fresh one with fresh outputs (an output can
+    /// belong to one session only, and the old session may still own them). Session queue only.
+    ///
+    /// The old session is emptied and its configuration block closed first, so it can be stopped
+    /// and releases the camera and microphone before the new one starts: an empty graph always
+    /// validates, which lets the pending outermost commit go through. `configurationOpen` says
+    /// whether a block is still open (then no new beginConfiguration is issued).
+    private func replaceSession(reason: String, configurationOpen: Bool) {
+        let old = session
+        videoOutput.setSampleBufferDelegate(nil, queue: nil)
+        audioOutput.setSampleBufferDelegate(nil, queue: nil)
+        referenceAudioOutput?.setSampleBufferDelegate(nil, queue: nil)
+        if let ex = LCCatchObjCException({
+            if !configurationOpen { old.beginConfiguration() }
+            for o in old.outputs { old.removeOutput(o) }
+            for i in old.inputs { old.removeInput(i) }
+            old.commitConfiguration()
+        }) {
+            diagnostics.log("capture", "Emptying the old session raised: \(Self.firstLine(ex))")
         }
-        inConfiguration = false
+        if old.isRunning {
+            if let ex = LCCatchObjCException({ old.stopRunning() }) {
+                diagnostics.log("capture", "Stopping the old session raised: \(Self.firstLine(ex))")
+            }
+        }
+        sessionBox.value = AVCaptureSession()
+        videoOutput = AVCaptureVideoDataOutput()
+        audioOutput = AVCaptureAudioDataOutput()
+        referenceAudioOutput = nil
         videoInput = nil
         audioInput = nil
+        inConfiguration = false
+        appliedFOA = false
+        appliedReferenceAudioOutput = false
         reference.detach()
+        sessionReplacements += 1
+        diagnostics.log("capture", "Capture session replaced (\(reason)); replacement #\(sessionReplacements)")
+        DispatchQueue.main.async { self.sessionVersion += 1 }
     }
 
     // MARK: Runtime errors and interruptions (session queue)
@@ -768,6 +969,10 @@ final class CaptureManager: NSObject, ObservableObject {
         let base = currentFallbacks
         ladderBase = base
         var singles: [(Fallbacks, String)] = []
+        if appliedReferenceAudioOutput {
+            var f = base; f.referenceAudio = 1
+            singles.append((f, "second (stereo) audio output for the HEVC reference removed"))
+        }
         if appliedMovieOutput {
             var f = base; f.reference = 1
             singles.append((f, "MovieFileOutput removed; HEVC reference now encoded by AVAssetWriter from the same frames"))
@@ -777,8 +982,15 @@ final class CaptureManager: NSObject, ObservableObject {
             singles.append((f, "video stabilization disabled for this format on this device"))
         }
         if appliedMultichannel {
-            var f = base; f.audio = max(f.audio, 2)
-            singles.append((f, "spatial/stereo microphone mode disabled"))
+            // Spatial capture steps down to stereo first; stereo steps down to no multichannel mode.
+            var f = base
+            if appliedFOA {
+                f.audio = max(f.audio, 1); f.referenceAudio = 1
+                singles.append((f, "spatial audio replaced by stereo"))
+            } else {
+                f.audio = max(f.audio, 2)
+                singles.append((f, "stereo microphone mode disabled"))
+            }
         }
         var steps = singles
         if singles.count >= 2 {
@@ -789,19 +1001,27 @@ final class CaptureManager: NSObject, ObservableObject {
                     f.reference = max(f.reference, g.reference)
                     f.stabilization = max(f.stabilization, g.stabilization)
                     f.audio = max(f.audio, g.audio)
+                    f.referenceAudio = max(f.referenceAudio, g.referenceAudio)
                     steps.append((f, singles[i].1 + " and " + singles[j].1))
                 }
             }
         }
-        if singles.count == 3 {
-            var f = base; f.reference = 1; f.stabilization = 1; f.audio = max(f.audio, 2)
-            steps.append((f, "MovieFileOutput, stabilization and multichannel audio all disabled"))
+        if appliedMovieOutput || appliedStabilization || appliedMultichannel {
+            var f = base
+            if appliedMovieOutput { f.reference = 1 }
+            if appliedStabilization { f.stabilization = 1 }
+            if appliedMultichannel { f.audio = max(f.audio, 2) }
+            f.referenceAudio = 1
+            if !steps.contains(where: { $0.0 == f }) {
+                steps.append((f, "MovieFileOutput, stabilization and multichannel audio all disabled"))
+            }
         }
         if audioInput != nil {
             var f = base
             if appliedMovieOutput { f.reference = 1 }
             if appliedStabilization { f.stabilization = 1 }
             f.audio = 3
+            f.referenceAudio = 1
             steps.append((f, "microphone input disabled"))
         }
         ladder = steps
@@ -1096,9 +1316,12 @@ final class CaptureManager: NSObject, ObservableObject {
 
 // MARK: - Sample buffer delegates
 
+// The manager is the delegate of exactly one video and one audio data output (the lossless ones);
+// the reference's stereo output has its own delegate (ReferenceAudioTap). Dispatch is by type:
+// the output references are replaced on the session queue while these callbacks run on others.
 extension CaptureManager: AVCaptureVideoDataOutputSampleBufferDelegate, AVCaptureAudioDataOutputSampleBufferDelegate {
     func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {
-        if output === videoOutput {
+        if output is AVCaptureVideoDataOutput {
             let now = CACurrentMediaTime()
             previewRate.add(1, at: now)
             if now - lastPreviewPublish > 0.5 {
@@ -1107,20 +1330,48 @@ extension CaptureManager: AVCaptureVideoDataOutputSampleBufferDelegate, AVCaptur
                 DispatchQueue.main.async { self.previewFps = fps }
             }
             pipeline.ingestVideo(sampleBuffer)
-        } else if output === audioOutput {
-            reference.noteAudioFormat(sampleBuffer)
+        } else if output is AVCaptureAudioDataOutput {
+            reference.noteAudioFormat(sampleBuffer, dedicated: false)
             pipeline.ingestAudio(sampleBuffer)
         }
     }
 
     func captureOutput(_ output: AVCaptureOutput, didDrop sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {
-        if output === videoOutput {
+        if output is AVCaptureVideoDataOutput {
             var reason = "unknown"
             if let att = CMGetAttachment(sampleBuffer, key: kCMSampleBufferAttachmentKey_DroppedFrameReason, attachmentModeOut: nil) {
                 reason = String(describing: att)
             }
             pipeline.noteSourceDrop(reason: reason)
         }
+    }
+}
+
+/// Delegate of the stereo audio data output that exists only for the HEVC reference while the
+/// lossless output captures first-order ambisonics.
+final class ReferenceAudioTap: NSObject, AVCaptureAudioDataOutputSampleBufferDelegate {
+    private weak var reference: ReferenceRecorder?
+
+    init(reference: ReferenceRecorder) {
+        self.reference = reference
+        super.init()
+    }
+
+    func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {
+        guard let reference = reference else { return }
+        reference.noteAudioFormat(sampleBuffer, dedicated: true)
+        reference.appendDedicatedAudio(sampleBuffer)
+    }
+}
+
+/// Lock-protected reference to the current capture session (read from any thread, replaced on
+/// the session queue).
+final class SessionBox {
+    private let lock = NSLock()
+    private var current = AVCaptureSession()
+    var value: AVCaptureSession {
+        get { lock.lock(); defer { lock.unlock() }; return current }
+        set { lock.lock(); current = newValue; lock.unlock() }
     }
 }
 
