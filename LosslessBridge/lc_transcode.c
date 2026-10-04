@@ -136,7 +136,7 @@ int lc_transcode_intermediate(const char *lci_path, const char *mkv_path,
     const size_t ysize = row * (size_t)c->height;
 
     for (size_t vi = 0; vi < nv; vi++) {
-        if (cancel && *cancel) { ret = AVERROR_EXIT; lc_set_err(err, errlen, "cancelled"); goto done; }
+        if (lc_job_should_stop(cancel)) { ret = AVERROR_EXIT; lc_set_err(err, errlen, "cancelled"); goto done; }
         const LCIEntry *e = &vids[vi];
 
         /* Audio chunks that precede this frame go first. */
@@ -217,7 +217,7 @@ int lc_transcode_intermediate(const char *lci_path, const char *mkv_path,
     }
     /* Trailing audio. */
     while (ai < na) {
-        if (cancel && *cancel) { ret = AVERROR_EXIT; lc_set_err(err, errlen, "cancelled"); goto done; }
+        if (lc_job_should_stop(cancel)) { ret = AVERROR_EXIT; lc_set_err(err, errlen, "cancelled"); goto done; }
         const LCIEntry *ae = &auds[ai];
         if (ae->hdr.size > payload_cap) {
             uint8_t *np = (uint8_t *)realloc(payload, (size_t)ae->hdr.size + AV_INPUT_BUFFER_PADDING_SIZE);

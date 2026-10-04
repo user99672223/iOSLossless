@@ -54,7 +54,7 @@ int lc_verify_recording(const char *mkv_path, const char *hashlist_path, int thr
     LCVideoFrame f;
     int vstatus = LC_VERIFY_PASS;
     for (;;) {
-        if (cancel && *cancel) { vstatus = LC_VERIFY_CANCELLED; break; }
+        if (lc_job_should_stop(cancel)) { vstatus = LC_VERIFY_CANCELLED; break; }
         int got = lc_decoder_next_video(vd, &f);
         if (got < 0) {
             char b[64];
@@ -64,9 +64,14 @@ int lc_verify_recording(const char *mkv_path, const char *hashlist_path, int thr
         }
         if (got == 0) break;
         int64_t i = r.frames_decoded;
+        r.frames_decoded++;
+        if (!hl->complete && i >= hl->video_count) {
+            /* Interrupted recording: hashes past the last flushed record were lost. */
+            r.frames_unverified++;
+            continue;
+        }
         uint64_t h = lc_hash_planar_as_biplanar(f.planes[0], f.strides[0], f.planes[1], f.strides[1],
                                                 f.planes[2], f.strides[2], info.width, info.height, bps, scratch);
-        r.frames_decoded++;
         if (i < hl->video_count && h == hl->video_hash[i]) {
             r.frames_matched++;
         } else if (r.first_mismatch_frame < 0) {
@@ -82,16 +87,26 @@ int lc_verify_recording(const char *mkv_path, const char *hashlist_path, int thr
     free(scratch);
     lc_decoder_close(vd);
     if (vstatus == LC_VERIFY_PASS) {
-        if (r.frames_decoded != hl->video_count || r.frames_matched != hl->video_count || r.crc_errors > 0)
+        const int64_t checked = r.frames_decoded - r.frames_unverified;
+        /* An interrupted recording (no trailer record) may have hashed frames that never
+         * reached the file (lost with the writer's last buffer) or stored frames whose
+         * hashes were lost; only the overlap can be checked. */
+        const int64_t expected = hl->complete ? hl->video_count : (checked < hl->video_count ? checked : hl->video_count);
+        r.frames_expected = expected;
+        if (checked != expected || r.frames_matched != expected || r.crc_errors > 0)
             vstatus = LC_VERIFY_FAIL;
-        if (r.frames_decoded != hl->video_count && r.first_mismatch_frame < 0)
-            r.first_mismatch_frame = r.frames_decoded < hl->video_count ? r.frames_decoded : hl->video_count;
+        if (checked != expected && r.first_mismatch_frame < 0)
+            r.first_mismatch_frame = checked < expected ? checked : expected;
+        if (vstatus == LC_VERIFY_PASS && !hl->complete)
+            lc_set_err(err, errlen, "interrupted recording: %lld frames verified; %lld stored frames have no capture hash; %lld hashed frames are not in the file",
+                       (long long)r.frames_matched, (long long)r.frames_unverified,
+                       (long long)(hl->video_count > checked ? hl->video_count - checked : 0));
     }
     r.video_status = vstatus;
 
     /* ---------------- audio ---------------- */
     if (vstatus != LC_VERIFY_CANCELLED && hl->header.audio_sample_rate > 0 && hl->header.audio_channels > 0 &&
-        hl->total_audio_frames == 0 && hl->audio_checkpoint_count == 0) {
+        !hl->audio_final_present && hl->audio_checkpoint_count == 0) {
         /* Audio was captured but no committed-stream hash exists (stage 2 did not finish). */
         r.audio_status = LC_VERIFY_ERROR;
         lc_set_err(err, errlen, "no audio hash recorded for this recording (stage 2 incomplete?)");
@@ -118,7 +133,9 @@ int lc_verify_recording(const char *mkv_path, const char *hashlist_path, int thr
                 int64_t ck = 0;       /* next checkpoint index */
                 if (!buf || !hs) astatus = LC_VERIFY_ERROR;
                 while (astatus == LC_VERIFY_PASS) {
-                    if (cancel && *cancel) { astatus = LC_VERIFY_CANCELLED; break; }
+                    if (lc_job_should_stop(cancel)) { astatus = LC_VERIFY_CANCELLED; break; }
+                    /* Interrupted recording without a final digest: verified up to the last checkpoint. */
+                    if (!hl->audio_final_present && ck >= hl->audio_checkpoint_count) break;
                     /* Feed up to the next checkpoint boundary so digests align. */
                     int want = chunk;
                     if (ck < hl->audio_checkpoint_count) {
@@ -159,7 +176,7 @@ int lc_verify_recording(const char *mkv_path, const char *hashlist_path, int thr
                         }
                         ck++;
                     }
-                    if (astatus == LC_VERIFY_PASS) {
+                    if (astatus == LC_VERIFY_PASS && hl->audio_final_present) {
                         if (pos != hl->total_audio_frames || lc_hash_digest(hs) != hl->final_audio_hash) {
                             astatus = LC_VERIFY_FAIL;
                             if (r.audio_first_mismatch_frame < 0)

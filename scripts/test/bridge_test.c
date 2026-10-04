@@ -7,6 +7,10 @@
  *   5. Verification of both MKVs against the capture-time hash list (PASS)
  *   6. Tamper test: corrupt the hash list -> verification must FAIL
  *   7. Decoder seeking by frame index and luma metrics on identical frames
+ *   8. Repeated / cancelled / paused stage 2 keeps the hash list verifiable
+ *   9. Dropped frames: the real timeline (gaps) survives into the MKV and the decoder
+ *  10. Interrupted real-time recording (no trailer): index rebuilt, prefix verifies
+ *  11. Intermediate probe (crash recovery) and NaN audio input
  *
  * Build: scripts/test/run-bridge-tests.sh
  */
@@ -16,6 +20,8 @@
 #include <string.h>
 #include <math.h>
 #include <stdint.h>
+#include <pthread.h>
+#include <unistd.h>
 
 #define CHECK(cond, ...) do { if (!(cond)) { fprintf(stderr, "FAIL %s:%d: ", __FILE__, __LINE__); fprintf(stderr, __VA_ARGS__); fprintf(stderr, "\n"); return 1; } } while (0)
 
@@ -38,6 +44,14 @@ static void gen_audio(int32_t *buf, int nb, int64_t start_frame)
             buf[i * CH + c] = (int32_t)((uint32_t)q << 8);
         }
     }
+}
+
+static void *resume_later(void *arg)
+{
+    volatile int *ctl = (volatile int *)arg;
+    usleep(200 * 1000);
+    *ctl = 0;
+    return NULL;
 }
 
 static int run_two_stage(LCStage1Codec codec, const char *dir, const char *tag, int *frames_out)
@@ -143,6 +157,35 @@ static int run_two_stage(LCStage1Codec codec, const char *dir, const char *tag, 
     printf("  [%s] verify PASS: %lld frames, %lld audio frames, %.2fs\n", tag, (long long)vr.frames_matched,
            (long long)vr.audio_frames_decoded, vr.seconds);
     *frames_out = (int)vr.frames_matched;
+
+    /* Probe (what the library uses to adopt an intermediate left by a crash). */
+    {
+        LCIntermediateConfig pc; LCIntermediateProbe pr;
+        CHECK(lc_lci_probe(lci, &pc, &pr, err, sizeof(err)) == 0, "probe: %s", err);
+        CHECK(pr.video_frames == FRAMES && pc.width == W && pc.height == H && pc.codec == codec && !pr.recovered_without_trailer,
+              "probe frames %lld codec %d", (long long)pr.video_frames, (int)pc.codec);
+        CHECK(pr.last_video_pts_ns - pr.first_video_pts_ns == (FRAMES - 1) * frame_ns, "probe pts span");
+    }
+
+    /* Stage 2 again (user re-runs it), then a cancelled run followed by a paused
+     * run: the hash list must keep exactly one audio series and verify PASS. */
+    {
+        rc = lc_transcode_intermediate(lci, mkv, &p, 5, meta, hashp, 4800, progress, NULL, &cancel, &st, err, sizeof(err));
+        CHECK(rc == 0, "repeat transcode: %s", err);
+        volatile int stop = 1;
+        rc = lc_transcode_intermediate(lci, mkv, &p, 5, meta, hashp, 4800, progress, NULL, &stop, &st, err, sizeof(err));
+        CHECK(rc != 0, "cancelled transcode returned success");
+        volatile int ctl = 2;
+        pthread_t th;
+        CHECK(pthread_create(&th, NULL, resume_later, (void *)&ctl) == 0, "thread");
+        rc = lc_transcode_intermediate(lci, mkv, &p, 5, meta, hashp, 4800, progress, NULL, &ctl, &st, err, sizeof(err));
+        pthread_join(th, NULL);
+        CHECK(rc == 0, "paused-then-resumed transcode: %s", err);
+        rc = lc_verify_recording(mkv, hashp, 0, progress, NULL, &cancel, &vr, err, sizeof(err));
+        CHECK(rc == 0 && vr.status == LC_VERIFY_PASS, "verify after repeated stage 2: status %d video %d audio %d (%s)",
+              vr.status, vr.video_status, vr.audio_status, err);
+        printf("  [%s] repeated / cancelled / paused stage 2 -> verify PASS\n", tag);
+    }
 
     /* Tamper: flip a bit in a stored hash -> must fail at that frame. */
     {
@@ -264,6 +307,135 @@ static int run_realtime(const char *dir)
     return 0;
 }
 
+/* Writes a real-time recording whose video skips `gap` frame slots after frame
+ * `before` (the ring buffer dropped them) while audio stays continuous. */
+static int run_gaps(const char *dir)
+{
+    char mkv[512], hashp[512], err[256] = {0};
+    snprintf(mkv, sizeof(mkv), "%s/gaps.mkv", dir);
+    snprintf(hashp, sizeof(hashp), "%s/gaps.lchash", dir);
+    const int before = 5, gap = 60, after = 5;
+    LCMkvConfig mc = {
+        .width = W, .height = H, .pix_fmt = LC_PIX_YUV420P10,
+        .color_primaries = LC_COLOR_PRI_BT2020, .color_trc = LC_COLOR_TRC_ARIB_STD_B67,
+        .colorspace = LC_COLOR_SPC_BT2020_NCL, .chroma_location = LC_CHROMA_LOC_LEFT,
+        .fps_num = FPS, .fps_den = 1,
+        .ffv1 = { .level = 3, .coder = 1, .context = 1, .slices = 4, .slicecrc = 1, .threads = 0, .gop = 1 },
+        .audio_enabled = 1, .audio_sample_rate = SR, .audio_channels = 2, .flac_compression_level = 5,
+    };
+    LCMkvWriter *w = lc_mkv_open(mkv, &mc, err, sizeof(err));
+    CHECK(w, "mkv open: %s", err);
+    LCHashListHeader hh = { .width = W, .height = H, .bit_depth = 10, .fps_num = FPS, .fps_den = 1,
+                            .audio_sample_rate = SR, .audio_channels = 2, .audio_checkpoint_interval = 4800 };
+    LCHashListWriter *hw = lc_hashlist_open(hashp, &hh, err, sizeof(err));
+    CHECK(hw, "hashlist: %s", err);
+    const size_t ys = (size_t)W * 2;
+    uint8_t *y = malloc(ys * H), *c = malloc(ys * (H / 2));
+    int32_t *audio = calloc(800 * 2, sizeof(int32_t));
+    const int64_t frame_ns = 1000000000LL / FPS;
+    int64_t idx = 0, audio_frames = 0;
+    for (int slot = 0; slot < before + gap + after; slot++) {
+        int64_t pts = (int64_t)slot * frame_ns;
+        if (slot < before || slot >= before + gap) {
+            lc_fill_test_frame(y, ys, c, ys, W, H, 2, 500u + (uint32_t)slot);
+            CHECK(lc_mkv_write_video_biplanar(w, y, ys, c, ys, pts) == 0, "video: %s", lc_mkv_last_error(w));
+            lc_hashlist_add_video(hw, idx++, pts, lc_hash_biplanar(y, ys, c, ys, W, H, 2));
+        }
+        for (int s = 0; s < 800; s++) audio[2 * s] = audio[2 * s + 1] = (int32_t)((uint32_t)((slot * 800 + s) & 0x7FFFF) << 8);
+        CHECK(lc_mkv_write_audio(w, audio, 800, (int64_t)audio_frames * 1000000000LL / SR) == 0, "audio");
+        audio_frames += 800;
+        if (audio_frames % 4800 == 0)
+            lc_hashlist_add_audio_checkpoint(hw, audio_frames, 0, lc_mkv_audio_running_hash(w));
+    }
+    CHECK(lc_mkv_audio_discontinuities(w) == 0 && lc_mkv_audio_silence_frames_inserted(w) == 0, "audio must stay continuous across video gaps");
+    uint64_t fh = lc_mkv_audio_running_hash(w);
+    CHECK(lc_mkv_close(w) == 0, "close");
+    CHECK(lc_hashlist_close(hw, idx, gap, audio_frames, fh) == 0, "hashlist close");
+    free(y); free(c); free(audio);
+
+    LCDecoder *d = lc_decoder_open(mkv, 1, 0, 2, err, sizeof(err));
+    CHECK(d, "decoder: %s", err);
+    LCMediaInfo info; lc_decoder_get_info(d, &info);
+    CHECK(info.frame_count == before + after && info.frame_count_exact && info.finalized, "frames %lld exact %d finalized %d",
+          (long long)info.frame_count, info.frame_count_exact, info.finalized);
+    const int64_t span = (int64_t)(before + gap + after) * frame_ns;
+    CHECK(llabs(info.duration_ns - span) <= 2000000, "duration %lld vs real timeline %lld", (long long)info.duration_ns, (long long)span);
+    int64_t gaps = 0, missing = 0;
+    lc_decoder_timeline_stats(d, &gaps, &missing);
+    CHECK(gaps == 1 && missing == gap, "timeline stats gaps %lld missing %lld", (long long)gaps, (long long)missing);
+    int64_t p5 = lc_decoder_frame_pts(d, before);
+    CHECK(llabs(p5 - (int64_t)(before + gap) * frame_ns) <= 1000000, "frame %d pts %lld", before, (long long)p5);
+    CHECK(lc_decoder_seek_frame(d, before) == 0, "seek across gap");
+    LCVideoFrame f;
+    CHECK(lc_decoder_next_video(d, &f) == 1 && f.index == before, "seek landed on %lld", (long long)f.index);
+    lc_decoder_close(d);
+
+    LCVerifyResult vr; volatile int cancel = 0;
+    CHECK(lc_verify_recording(mkv, hashp, 0, progress, NULL, &cancel, &vr, err, sizeof(err)) == 0 && vr.status == LC_VERIFY_PASS,
+          "gapped recording verify: status %d (%s)", vr.status, err);
+    printf("  [gaps] %d frames over a %.3f s timeline, 1 gap of %d frames, verify PASS\n", before + after, span / 1e9, gap);
+    return 0;
+}
+
+/* The app was killed while the real-time writer was open: no Cues, no trailer. */
+static int run_unfinalised(const char *dir)
+{
+    char mkv[512], hashp[512], err[256] = {0};
+    snprintf(mkv, sizeof(mkv), "%s/unfinalised.mkv", dir);
+    snprintf(hashp, sizeof(hashp), "%s/unfinalised.lchash", dir);
+    const int N = 30;
+    LCMkvConfig mc = {
+        .width = W, .height = H, .pix_fmt = LC_PIX_YUV420P10,
+        .color_primaries = LC_COLOR_PRI_BT2020, .color_trc = LC_COLOR_TRC_ARIB_STD_B67,
+        .colorspace = LC_COLOR_SPC_BT2020_NCL, .chroma_location = LC_CHROMA_LOC_LEFT,
+        .fps_num = FPS, .fps_den = 1,
+        .ffv1 = { .level = 3, .coder = 1, .context = 1, .slices = 4, .slicecrc = 1, .threads = 0, .gop = 1 },
+        .audio_enabled = 1, .audio_sample_rate = SR, .audio_channels = 2, .flac_compression_level = 5,
+    };
+    LCMkvWriter *w = lc_mkv_open(mkv, &mc, err, sizeof(err));
+    CHECK(w, "mkv open: %s", err);
+    LCHashListHeader hh = { .width = W, .height = H, .bit_depth = 10, .fps_num = FPS, .fps_den = 1,
+                            .audio_sample_rate = SR, .audio_channels = 2, .audio_checkpoint_interval = 4800 };
+    LCHashListWriter *hw = lc_hashlist_open(hashp, &hh, err, sizeof(err));
+    CHECK(hw, "hashlist: %s", err);
+    const size_t ys = (size_t)W * 2;
+    uint8_t *y = malloc(ys * H), *c = malloc(ys * (H / 2));
+    int32_t *audio = calloc(800 * 2, sizeof(int32_t));
+    const int64_t frame_ns = 1000000000LL / FPS;
+    int64_t audio_frames = 0;
+    for (int i = 0; i < N; i++) {
+        lc_fill_test_frame(y, ys, c, ys, W, H, 2, 900u + (uint32_t)i);
+        CHECK(lc_mkv_write_video_biplanar(w, y, ys, c, ys, (int64_t)i * frame_ns) == 0, "video");
+        lc_hashlist_add_video(hw, i, (int64_t)i * frame_ns, lc_hash_biplanar(y, ys, c, ys, W, H, 2));
+        for (int s = 0; s < 800; s++) audio[2 * s] = audio[2 * s + 1] = (int32_t)((uint32_t)(s * 31) << 8);
+        CHECK(lc_mkv_write_audio(w, audio, 800, audio_frames * 1000000000LL / SR) == 0, "audio");
+        audio_frames += 800;
+        if (audio_frames % 4800 == 0)
+            lc_hashlist_add_audio_checkpoint(hw, audio_frames, 0, lc_mkv_audio_running_hash(w));
+    }
+    lc_mkv_abort(w);        /* simulated crash: no trailer, no Cues */
+    lc_hashlist_abort(hw);  /* no 'E'/'F' records */
+    free(y); free(c); free(audio);
+
+    LCDecoder *d = lc_decoder_open(mkv, 1, 0, 2, err, sizeof(err));
+    CHECK(d, "decoder on unfinalised file: %s", err);
+    LCMediaInfo info; lc_decoder_get_info(d, &info);
+    CHECK(!info.finalized, "unfinalised file reported as finalised");
+    /* Up to ~0.1 s at the tail is lost with the muxer's interleaving queue and open cluster. */
+    CHECK(info.frame_count >= N - 10 && info.frame_count <= N && info.frame_count_exact, "rebuilt frame count %lld", (long long)info.frame_count);
+    CHECK(llabs(info.duration_ns - info.frame_count * frame_ns) <= 2000000, "rebuilt duration %lld", (long long)info.duration_ns);
+    CHECK(lc_decoder_seek_frame(d, info.frame_count / 2) == 0, "seek in rebuilt index");
+    LCVideoFrame f;
+    CHECK(lc_decoder_next_video(d, &f) == 1 && f.index == info.frame_count / 2, "seek landed on %lld", (long long)f.index);
+    lc_decoder_close(d);
+
+    LCVerifyResult vr; volatile int cancel = 0;
+    CHECK(lc_verify_recording(mkv, hashp, 0, progress, NULL, &cancel, &vr, err, sizeof(err)) == 0 && vr.video_status == LC_VERIFY_PASS
+          && vr.audio_status == LC_VERIFY_PASS, "interrupted recording verify: video %d audio %d (%s)", vr.video_status, vr.audio_status, err);
+    printf("  [unfinalised] %lld of %d frames recovered, index rebuilt, prefix verify PASS (%s)\n", (long long)info.frame_count, N, err);
+    return 0;
+}
+
 int main(int argc, char **argv)
 {
     const char *dir = argc > 1 ? argv[1] : "/tmp";
@@ -331,6 +503,20 @@ int main(int argc, char **argv)
 
     /* 4./7. real-time path + decoder */
     CHECK(run_realtime(dir) == 0, "realtime");
+
+    /* 9./10. dropped frames and interrupted recordings */
+    CHECK(run_gaps(dir) == 0, "gaps");
+    CHECK(run_unfinalised(dir) == 0, "unfinalised");
+
+    /* 11. NaN float input is stored as silence and counted */
+    {
+        float fl[2] = { NAN, 0.5f };
+        int32_t out[2] = { 7, 7 };
+        const void *src[1] = { fl };
+        int64_t inexact = lc_audio_convert_to_s32_24(src, 0, LC_AUDIO_SRC_FLOAT32, 1, 2, out);
+        CHECK(inexact == 1 && out[0] == 0 && out[1] == (int32_t)(4194304u << 8), "NaN handling: inexact %lld out %d", (long long)inexact, out[0]);
+        printf("  [audio] NaN input stored as silence and counted\n");
+    }
 
     printf("ALL BRIDGE TESTS PASSED\n");
     return 0;

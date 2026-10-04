@@ -10,6 +10,7 @@
  *     'F': a = total audio frames, b = 0, c = final audio hash
  */
 #include "lc_internal.h"
+#include <unistd.h>
 
 #define LCHASH_MAGIC "LCHASH01"
 
@@ -25,7 +26,13 @@ struct LCHashListWriter {
     FILE *f;
     int64_t video_count;
     int64_t audio_checkpoints;
+    int     append_mode;      /* opened by lc_hashlist_open_append */
+    off_t   append_start;     /* file size before the appended records */
 };
+
+/* Capture-time records are flushed every this many video records so an
+ * interrupted recording keeps a verifiable prefix. */
+#define LCHASH_FLUSH_EVERY 64
 
 static int write_record(FILE *f, uint8_t type, int64_t a, int64_t b, uint64_t c)
 {
@@ -55,11 +62,41 @@ LCHashListWriter *lc_hashlist_open(const char *path, const LCHashListHeader *hdr
 
 LCHashListWriter *lc_hashlist_open_append(const char *path, char *err, size_t errlen)
 {
-    FILE *f = fopen(path, "ab");
+    FILE *f = fopen(path, "r+b");
     if (!f) { lc_set_err(err, errlen, "cannot append to %s: %s", path, strerror(errno)); return NULL; }
+    char magic[8];
+    LCHashListHeader hdr;
+    if (fread(magic, 1, 8, f) != 8 || memcmp(magic, LCHASH_MAGIC, 8) != 0 || fread(&hdr, sizeof(hdr), 1, f) != 1) {
+        lc_set_err(err, errlen, "not a LosslessCam hash list: %s", path);
+        fclose(f);
+        return NULL;
+    }
+    /* The capture-time list ends with its 'E' record and the 'F' record that
+     * follows it; anything after that was appended by an earlier stage 2. */
+    off_t cut = -1;
+    int seen_e = 0;
+    LCHashRecord r;
+    for (;;) {
+        off_t at = ftello(f);
+        if (fread(&r, sizeof(r), 1, f) != 1) { if (cut < 0) cut = at; break; }
+        if (!seen_e) {
+            if (r.type == 'E') seen_e = 1;
+        } else if (cut < 0) {
+            cut = (r.type == 'F') ? ftello(f) : at;
+            break;
+        }
+    }
+    if (cut < 0) cut = ftello(f);
+    if (ftruncate(fileno(f), cut) != 0 || fseeko(f, cut, SEEK_SET) != 0) {
+        lc_set_err(err, errlen, "cannot reset %s: %s", path, strerror(errno));
+        fclose(f);
+        return NULL;
+    }
     LCHashListWriter *w = (LCHashListWriter *)calloc(1, sizeof(*w));
     if (!w) { fclose(f); return NULL; }
     w->f = f;
+    w->append_mode = 1;
+    w->append_start = cut;
     return w;
 }
 
@@ -78,7 +115,9 @@ int lc_hashlist_add_video(LCHashListWriter *w, int64_t frame_index, int64_t pts_
 {
     if (!w) return -1;
     w->video_count++;
-    return write_record(w->f, 'V', frame_index, pts_ns, hash);
+    int ret = write_record(w->f, 'V', frame_index, pts_ns, hash);
+    if (ret == 0 && w->video_count % LCHASH_FLUSH_EVERY == 0 && fflush(w->f) != 0) ret = -1;
+    return ret;
 }
 
 int lc_hashlist_add_audio_checkpoint(LCHashListWriter *w, int64_t audio_frames_total,
@@ -86,7 +125,9 @@ int lc_hashlist_add_audio_checkpoint(LCHashListWriter *w, int64_t audio_frames_t
 {
     if (!w) return -1;
     w->audio_checkpoints++;
-    return write_record(w->f, 'A', audio_frames_total, pts_ns, running_hash);
+    int ret = write_record(w->f, 'A', audio_frames_total, pts_ns, running_hash);
+    if (ret == 0 && !w->append_mode && fflush(w->f) != 0) ret = -1;
+    return ret;
 }
 
 int lc_hashlist_close(LCHashListWriter *w, int64_t total_video_frames, int64_t dropped_frames,
@@ -105,6 +146,11 @@ int lc_hashlist_close(LCHashListWriter *w, int64_t total_video_frames, int64_t d
 void lc_hashlist_abort(LCHashListWriter *w)
 {
     if (!w) return;
+    if (w->append_mode) {
+        /* Drop the partial stage-2 series so a retry starts from the capture-time list. */
+        fflush(w->f);
+        if (ftruncate(fileno(w->f), w->append_start) != 0) { /* left as is; the loader keeps only the last series */ }
+    }
     fclose(w->f);
     free(w);
 }
@@ -153,6 +199,10 @@ LCHashList *lc_hashlist_load(const char *path, char *err, size_t errlen)
             l->video_count++;
             break;
         case 'A':
+            /* A non-increasing position starts a new series (a repeated stage 2
+             * in a list written before truncation existed): keep only the latest. */
+            if (l->audio_checkpoint_count > 0 && r.a <= l->audio_frames[l->audio_checkpoint_count - 1])
+                l->audio_checkpoint_count = 0;
             if (grow3(&l->audio_frames, &l->audio_pts_ns, &l->audio_hash, &acap, l->audio_checkpoint_count + 1) < 0) goto oom;
             l->audio_frames[l->audio_checkpoint_count] = r.a;
             l->audio_pts_ns[l->audio_checkpoint_count] = r.b;
@@ -167,6 +217,9 @@ LCHashList *lc_hashlist_load(const char *path, char *err, size_t errlen)
         case 'F':
             l->total_audio_frames = r.a;
             l->final_audio_hash = r.c;
+            /* Stage 1 of a two-stage recording writes a placeholder F(0, 0); a committed
+             * stream always has a non-zero XXH64 digest (even when empty). */
+            l->audio_final_present = r.c != 0;
             break;
         default:
             break;

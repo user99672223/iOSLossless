@@ -38,17 +38,26 @@ jobs:
       - name: Run bridge tests
         run: LC_FFMPEG_OUT="$PWD/build/ffmpeg-host" LC_TEST_OUT="$PWD/build/bridge-test" scripts/test/run-bridge-tests.sh
 
+      - name: Run bridge tests under AddressSanitizer + UndefinedBehaviorSanitizer
+        run: >
+          CC=gcc
+          EXTRA_CFLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer -fno-sanitize-recover=undefined"
+          LC_FFMPEG_OUT="$PWD/build/ffmpeg-host" LC_TEST_OUT="$PWD/build/bridge-test-asan"
+          scripts/test/run-bridge-tests.sh
+
   build-ipa:
     name: Unsigned IPA (iOS arm64)
+    # The IPA (and a release) is only produced when the lossless pipeline tests pass.
+    needs: bridge-tests
     runs-on: macos-15
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
 
-      - name: Select newest Xcode on the runner
+      - name: Select newest release Xcode on the runner (betas excluded)
         id: xcode
         run: |
-          XCODE_APP="$(ls -d /Applications/Xcode_*.app | sort -V | tail -1)"
+          XCODE_APP="$(ls -d /Applications/Xcode_*.app | grep -v -i -E 'beta|rc' | sort -V | tail -1)"
           echo "Using $XCODE_APP"
           sudo xcode-select -s "$XCODE_APP"
           xcodebuild -version
@@ -122,6 +131,7 @@ jobs:
           name: LosslessCam.ipa
           path: build/LosslessCam.ipa
           if-no-files-found: error
+          retention-days: 90
 
       - name: Upload build log
         if: always()
@@ -130,6 +140,7 @@ jobs:
           name: xcodebuild-log
           path: build/xcodebuild.log
           if-no-files-found: ignore
+          retention-days: 30
 
       - name: Attach IPA to release
         if: startsWith(github.ref, 'refs/tags/v')

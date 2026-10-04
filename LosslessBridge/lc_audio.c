@@ -61,6 +61,7 @@ int64_t lc_audio_convert_to_s32_24(const void *const *src, int non_interleaved,
             for (int i = 0; i < nb_frames; i++) {
                 float f = s[i * step_samples];
                 float c = f;
+                if (c != c) { c = 0.0f; inexact++; }   /* NaN: store silence, count it */
                 if (c > 1.0f) c = 1.0f;
                 if (c < -1.0f) c = -1.0f;
                 double q = rint((double)c * 8388608.0);
@@ -68,7 +69,7 @@ int64_t lc_audio_convert_to_s32_24(const void *const *src, int non_interleaved,
                 if (q < -8388608.0) q = -8388608.0;
                 int32_t qi = (int32_t)q;
                 /* Exact iff the float was already a 24-bit fixed-point value. */
-                if ((float)((double)qi / 8388608.0) != f) inexact++;
+                if (f == f && (float)((double)qi / 8388608.0) != f) inexact++;
                 dst[(size_t)i * channels + ch] = (int32_t)((uint32_t)qi << 8);
             }
             break;

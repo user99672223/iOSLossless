@@ -70,6 +70,54 @@ static void build_index(LCDecoder *d)
     d->idx_count = m;
 }
 
+static int cmp_i64(const void *pa, const void *pb)
+{
+    int64_t a = *(const int64_t *)pa, b = *(const int64_t *)pb;
+    return a < b ? -1 : (a > b ? 1 : 0);
+}
+
+/* A file that was not finalised (app killed while writing) has no Cues and no
+ * duration; the few index entries the demuxer collected while probing are not
+ * the frame list. Rebuild the index from every video packet instead. */
+static void scan_index(LCDecoder *d)
+{
+    enum AVDiscard *saved = (enum AVDiscard *)malloc(d->fmt->nb_streams * sizeof(enum AVDiscard));
+    if (!saved) return;
+    for (unsigned i = 0; i < d->fmt->nb_streams; i++) {
+        saved[i] = d->fmt->streams[i]->discard;
+        if ((int)i != d->vidx) d->fmt->streams[i]->discard = AVDISCARD_ALL;
+    }
+    if (av_seek_frame(d->fmt, d->vidx, 0, AVSEEK_FLAG_BACKWARD | AVSEEK_FLAG_ANY) < 0)
+        avformat_seek_file(d->fmt, -1, INT64_MIN, 0, INT64_MAX, 0);
+    int64_t cap = 4096, n = 0;
+    int64_t *ts = (int64_t *)malloc((size_t)cap * sizeof(int64_t));
+    AVPacket *pkt = av_packet_alloc();
+    while (ts && pkt && av_read_frame(d->fmt, pkt) >= 0) {
+        if (pkt->stream_index == d->vidx) {
+            int64_t t = pkt->pts != AV_NOPTS_VALUE ? pkt->pts : pkt->dts;
+            if (t != AV_NOPTS_VALUE) {
+                if (n == cap) {
+                    int64_t *nt = (int64_t *)realloc(ts, (size_t)cap * 2 * sizeof(int64_t));
+                    if (!nt) { av_packet_unref(pkt); break; }
+                    ts = nt; cap *= 2;
+                }
+                ts[n++] = t;   /* the demuxer records the cluster of every keyframe it reads, so seeking works too */
+            }
+        }
+        av_packet_unref(pkt);
+    }
+    av_packet_free(&pkt);
+    for (unsigned i = 0; i < d->fmt->nb_streams; i++) d->fmt->streams[i]->discard = saved[i];
+    free(saved);
+    if (!ts) return;
+    qsort(ts, (size_t)n, sizeof(int64_t), cmp_i64);
+    int64_t m = 0;
+    for (int64_t i = 0; i < n; i++) if (m == 0 || ts[i] != ts[m - 1]) ts[m++] = ts[i];
+    free(d->idx_ts);
+    d->idx_ts = ts;
+    d->idx_count = m;
+}
+
 static int64_t index_lookup(const LCDecoder *d, int64_t ts)
 {
     /* nearest entry by binary search */
@@ -148,11 +196,26 @@ LCDecoder *lc_decoder_open(const char *path, int want_video, int want_audio, int
             if (st->duration > 0 && st->duration != AV_NOPTS_VALUE)
                 d->info.duration_ns = ts_to_ns(st->duration, st->time_base);
 
+            /* A finalised file carries a duration (written with the trailer
+             * together with the Cues); without one the index must be rebuilt. */
+            d->info.finalized = d->fmt->duration_estimation_method != AVFMT_DURATION_FROM_BITRATE &&
+                                (d->fmt->duration > 0 || (st->duration > 0 && st->duration != AV_NOPTS_VALUE));
             /* The Matroska demuxer defers Cues parsing until the first seek;
              * seeking to the start forces the index to materialise. */
             if (av_seek_frame(d->fmt, d->vidx, 0, AVSEEK_FLAG_BACKWARD) >= 0)
                 avcodec_flush_buffers(d->vdec);
-            build_index(d);
+            if (d->info.finalized) {
+                build_index(d);
+            } else {
+                scan_index(d);
+                if (av_seek_frame(d->fmt, d->vidx, 0, AVSEEK_FLAG_BACKWARD | AVSEEK_FLAG_ANY) < 0)
+                    avformat_seek_file(d->fmt, -1, INT64_MIN, 0, INT64_MAX, 0);
+                avcodec_flush_buffers(d->vdec);
+                if (d->idx_count > 0) {
+                    int64_t fdur = (int64_t)llround(1e9 * fr.den / (double)fr.num);
+                    d->info.duration_ns = ts_to_ns(d->idx_ts[d->idx_count - 1] - d->idx_ts[0], st->time_base) + fdur;
+                }
+            }
             if (d->idx_count > 0) {
                 d->info.frame_count = d->idx_count;
                 d->info.frame_count_exact = 1;
@@ -351,6 +414,23 @@ int64_t lc_decoder_frame_pts(const LCDecoder *d, int64_t frame_index)
     return (int64_t)llround((double)frame_index * 1e9 * d->info.fps_den / (double)d->info.fps_num);
 }
 
+void lc_decoder_timeline_stats(const LCDecoder *d, int64_t *gap_count, int64_t *missing_frames)
+{
+    int64_t gaps = 0, missing = 0;
+    if (d && d->vdec && d->idx_count > 1 && d->info.fps_num > 0 && d->info.fps_den > 0) {
+        const double frame_ns = 1e9 * d->info.fps_den / (double)d->info.fps_num;
+        for (int64_t i = 1; i < d->idx_count; i++) {
+            const double delta = (double)ts_to_ns(d->idx_ts[i] - d->idx_ts[i - 1], d->vtb);
+            if (delta > 1.5 * frame_ns) {
+                gaps++;
+                missing += (int64_t)llround(delta / frame_ns) - 1;
+            }
+        }
+    }
+    if (gap_count) *gap_count = gaps;
+    if (missing_frames) *missing_frames = missing;
+}
+
 int64_t lc_decoder_frame_index_for_pts(const LCDecoder *d, int64_t pts_ns)
 {
     if (!d || !d->vdec) return 0;
@@ -389,7 +469,7 @@ static int convert_audio_frame(const AVFrame *f, int32_t *dst)
     case AV_SAMPLE_FMT_FLT: {
         const float *s = (const float *)f->data[0];
         for (size_t i = 0; i < (size_t)n * ch; i++) {
-            double q = rint((double)s[i] * 8388608.0);
+            double q = s[i] == s[i] ? rint((double)s[i] * 8388608.0) : 0.0;
             if (q > 8388607.0) q = 8388607.0; if (q < -8388608.0) q = -8388608.0;
             dst[i] = (int32_t)((uint32_t)(int32_t)q << 8);
         }
@@ -399,7 +479,7 @@ static int convert_audio_frame(const AVFrame *f, int32_t *dst)
         for (int c = 0; c < ch; c++) {
             const float *s = (const float *)f->data[c];
             for (int i = 0; i < n; i++) {
-                double q = rint((double)s[i] * 8388608.0);
+                double q = s[i] == s[i] ? rint((double)s[i] * 8388608.0) : 0.0;
                 if (q > 8388607.0) q = 8388607.0; if (q < -8388608.0) q = -8388608.0;
                 dst[(size_t)i * ch + c] = (int32_t)((uint32_t)(int32_t)q << 8);
             }

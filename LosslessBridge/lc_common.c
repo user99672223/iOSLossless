@@ -1,6 +1,7 @@
 /* Library init, logging hook with CRC-mismatch attribution, pixel format
  * mapping, shared FFV1 encoder configuration and LZ4 shim. */
 #include "lc_internal.h"
+#include <time.h>
 
 #ifdef __APPLE__
 #include <compression.h>
@@ -269,3 +270,15 @@ size_t lc_lz4_decompress(const uint8_t *src, size_t src_size, uint8_t *dst, size
     return n > 0 ? (size_t)n : 0;
 }
 #endif
+
+int lc_job_should_stop(volatile int *control)
+{
+    if (!control) return 0;
+    for (;;) {
+        int v = *control;
+        if (v == 1) return 1;
+        if (v != 2) return 0;
+        struct timespec ts = { 0, 50 * 1000 * 1000 };
+        nanosleep(&ts, NULL);
+    }
+}

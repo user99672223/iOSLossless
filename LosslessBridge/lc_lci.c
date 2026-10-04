@@ -9,6 +9,8 @@
  * A file without trailer (crash) is recovered by scanning the chunks.
  */
 #include "lc_internal.h"
+#include <fcntl.h>
+#include <unistd.h>
 
 #define LCI_MAGIC "LCI\x01"
 
@@ -245,9 +247,14 @@ void lc_s1_encoder_destroy(LCStage1Encoder *e)
 /* Writer                                                                    */
 /* ------------------------------------------------------------------------ */
 
+/* Chunks are written with pwrite() at offsets reserved under the mutex, so
+ * the lock is held only for bookkeeping and the compression workers never
+ * queue behind each other's 15-25 MB writes. In-flight writes are counted so
+ * close() writes the trailer only after every reserved chunk has landed. */
 struct LCIntermediateWriter {
-    FILE *f;
+    int fd;
     pthread_mutex_t mu;
+    pthread_cond_t idle;
     LCIEntry *entries;
     size_t count, cap;
     uint64_t pos;
@@ -255,41 +262,64 @@ struct LCIntermediateWriter {
     int64_t audio_seq;
     int channels;
     int failed;
+    int closed;
+    int inflight;
 };
+
+static int pwrite_all(int fd, const void *buf, size_t len, uint64_t off)
+{
+    const uint8_t *p = (const uint8_t *)buf;
+    while (len > 0) {
+        ssize_t n = pwrite(fd, p, len, (off_t)off);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            return -1;
+        }
+        if (n == 0) return -1;
+        p += n; len -= (size_t)n; off += (uint64_t)n;
+    }
+    return 0;
+}
 
 LCIntermediateWriter *lc_lci_open(const char *path, const LCIntermediateConfig *cfg,
                                   const uint8_t *extradata, size_t extradata_size,
                                   char *err, size_t errlen)
 {
     if (!path || !cfg) { lc_set_err(err, errlen, "invalid arguments"); return NULL; }
-    FILE *f = fopen(path, "wb");
-    if (!f) { lc_set_err(err, errlen, "cannot create %s: %s", path, strerror(errno)); return NULL; }
-    setvbuf(f, NULL, _IOFBF, 4 << 20);
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) { lc_set_err(err, errlen, "cannot create %s: %s", path, strerror(errno)); return NULL; }
     LCIConfigOnDisk d;
     cfg_to_disk(cfg, &d);
     uint32_t hdr_size = (uint32_t)(4 + 4 + sizeof(d) + 4 + extradata_size);
     uint32_t xs = (uint32_t)extradata_size;
-    if (fwrite(LCI_MAGIC, 1, 4, f) != 4 || fwrite(&hdr_size, 4, 1, f) != 1 ||
-        fwrite(&d, sizeof(d), 1, f) != 1 || fwrite(&xs, 4, 1, f) != 1 ||
-        (extradata_size && fwrite(extradata, 1, extradata_size, f) != extradata_size)) {
+    uint8_t *hdr = (uint8_t *)malloc(hdr_size);
+    if (!hdr) { close(fd); lc_set_err(err, errlen, "out of memory"); return NULL; }
+    memcpy(hdr, LCI_MAGIC, 4);
+    memcpy(hdr + 4, &hdr_size, 4);
+    memcpy(hdr + 8, &d, sizeof(d));
+    memcpy(hdr + 8 + sizeof(d), &xs, 4);
+    if (extradata_size) memcpy(hdr + 12 + sizeof(d), extradata, extradata_size);
+    int wr = pwrite_all(fd, hdr, hdr_size, 0);
+    free(hdr);
+    if (wr < 0) {
         lc_set_err(err, errlen, "write failed: %s", strerror(errno));
-        fclose(f);
+        close(fd);
         return NULL;
     }
     LCIntermediateWriter *w = (LCIntermediateWriter *)calloc(1, sizeof(*w));
-    if (!w) { fclose(f); return NULL; }
-    w->f = f;
+    if (!w) { close(fd); return NULL; }
+    w->fd = fd;
     w->pos = hdr_size;
     w->channels = cfg->audio_channels;
     pthread_mutex_init(&w->mu, NULL);
+    pthread_cond_init(&w->idle, NULL);
     return w;
 }
 
-static int append_chunk(LCIntermediateWriter *w, const LCIChunkHeader *h, const void *payload)
+static int append_chunk(LCIntermediateWriter *w, LCIChunkHeader *h, const void *payload, int assign_audio_seq)
 {
     pthread_mutex_lock(&w->mu);
-    int ret = 0;
-    if (w->failed) { pthread_mutex_unlock(&w->mu); return -1; }
+    if (w->failed || w->closed) { pthread_mutex_unlock(&w->mu); return -1; }
     if (w->count == w->cap) {
         size_t ncap = w->cap ? w->cap * 2 : 4096;
         LCIEntry *ne = (LCIEntry *)realloc(w->entries, ncap * sizeof(LCIEntry));
@@ -297,16 +327,25 @@ static int append_chunk(LCIntermediateWriter *w, const LCIChunkHeader *h, const 
         w->entries = ne;
         w->cap = ncap;
     }
-    if (fwrite(h, sizeof(*h), 1, w->f) != 1 || (h->size && fwrite(payload, 1, (size_t)h->size, w->f) != h->size)) {
-        w->failed = 1;
+    if (assign_audio_seq) h->index = w->audio_seq++;
+    const uint64_t off = w->pos;
+    w->entries[w->count].hdr = *h;
+    w->entries[w->count].offset = off + sizeof(*h);
+    w->count++;
+    w->pos += sizeof(*h) + h->size;
+    w->raw_bytes += h->raw_size;
+    w->inflight++;
+    pthread_mutex_unlock(&w->mu);
+
+    int ret = 0;
+    if (pwrite_all(w->fd, h, sizeof(*h), off) < 0 ||
+        (h->size && pwrite_all(w->fd, payload, (size_t)h->size, off + sizeof(*h)) < 0))
         ret = -1;
-    } else {
-        w->entries[w->count].hdr = *h;
-        w->entries[w->count].offset = w->pos + sizeof(*h);
-        w->count++;
-        w->pos += sizeof(*h) + h->size;
-        w->raw_bytes += h->raw_size;
-    }
+
+    pthread_mutex_lock(&w->mu);
+    if (ret < 0) w->failed = 1;
+    w->inflight--;
+    if (w->inflight == 0) pthread_cond_broadcast(&w->idle);
     pthread_mutex_unlock(&w->mu);
     return ret;
 }
@@ -324,7 +363,7 @@ int lc_lci_append_video(LCIntermediateWriter *w, int64_t frame_index, int64_t pt
     h.aux = hash;
     h.size = size;
     h.raw_size = raw_size;
-    return append_chunk(w, &h, data);
+    return append_chunk(w, &h, data, 0);
 }
 
 int lc_lci_append_audio(LCIntermediateWriter *w, int64_t pts_ns, const int32_t *samples, int nb_frames)
@@ -333,14 +372,11 @@ int lc_lci_append_audio(LCIntermediateWriter *w, int64_t pts_ns, const int32_t *
     LCIChunkHeader h;
     memset(&h, 0, sizeof(h));
     h.type = 'A';
-    pthread_mutex_lock(&w->mu);
-    h.index = w->audio_seq++;
-    pthread_mutex_unlock(&w->mu);
     h.pts_ns = pts_ns;
     h.aux = (uint64_t)nb_frames;
     h.size = (uint64_t)nb_frames * (uint64_t)w->channels * sizeof(int32_t);
     h.raw_size = h.size;
-    return append_chunk(w, &h, samples);
+    return append_chunk(w, &h, samples, 1);
 }
 
 int lc_lci_close(LCIntermediateWriter *w)
@@ -348,21 +384,37 @@ int lc_lci_close(LCIntermediateWriter *w)
     if (!w) return -1;
     int ret = 0;
     pthread_mutex_lock(&w->mu);
+    w->closed = 1;
+    while (w->inflight > 0) pthread_cond_wait(&w->idle, &w->mu);
     if (!w->failed) {
-        uint64_t trailer_off = w->pos;
-        uint64_t count = w->count;
-        if (fwrite("LCIX", 1, 4, w->f) != 4 || fwrite(&count, 8, 1, w->f) != 1) ret = -1;
-        for (size_t i = 0; i < w->count && ret == 0; i++) {
-            if (fwrite(&w->entries[i].hdr, sizeof(LCIChunkHeader), 1, w->f) != 1 ||
-                fwrite(&w->entries[i].offset, 8, 1, w->f) != 1) ret = -1;
+        /* Trailer: "LCIX" u64 count, count x (header + u64 offset), u64 trailer_offset, "LCIE". */
+        const uint64_t trailer_off = w->pos;
+        const uint64_t count = w->count;
+        const size_t rec = sizeof(LCIChunkHeader) + 8;
+        const size_t tsize = 4 + 8 + (size_t)count * rec + 8 + 4;
+        uint8_t *t = (uint8_t *)malloc(tsize);
+        if (!t) {
+            ret = -1;
+        } else {
+            uint8_t *p = t;
+            memcpy(p, "LCIX", 4); p += 4;
+            memcpy(p, &count, 8); p += 8;
+            for (size_t i = 0; i < w->count; i++) {
+                memcpy(p, &w->entries[i].hdr, sizeof(LCIChunkHeader)); p += sizeof(LCIChunkHeader);
+                memcpy(p, &w->entries[i].offset, 8); p += 8;
+            }
+            memcpy(p, &trailer_off, 8); p += 8;
+            memcpy(p, "LCIE", 4);
+            if (pwrite_all(w->fd, t, tsize, trailer_off) < 0) ret = -1;
+            free(t);
         }
-        if (ret == 0 && (fwrite(&trailer_off, 8, 1, w->f) != 1 || fwrite("LCIE", 1, 4, w->f) != 4)) ret = -1;
     } else {
         ret = -1;
     }
-    if (fflush(w->f) != 0) ret = -1;
-    if (fclose(w->f) != 0) ret = -1;
+    if (fsync(w->fd) != 0) ret = -1;
+    if (close(w->fd) != 0) ret = -1;
     pthread_mutex_unlock(&w->mu);
+    pthread_cond_destroy(&w->idle);
     pthread_mutex_destroy(&w->mu);
     free(w->entries);
     free(w);
@@ -372,14 +424,34 @@ int lc_lci_close(LCIntermediateWriter *w)
 void lc_lci_abort(LCIntermediateWriter *w)
 {
     if (!w) return;
-    fclose(w->f);
+    pthread_mutex_lock(&w->mu);
+    w->closed = 1;
+    while (w->inflight > 0) pthread_cond_wait(&w->idle, &w->mu);
+    pthread_mutex_unlock(&w->mu);
+    close(w->fd);
+    pthread_cond_destroy(&w->idle);
     pthread_mutex_destroy(&w->mu);
     free(w->entries);
     free(w);
 }
 
-uint64_t lc_lci_bytes_written(const LCIntermediateWriter *w) { return w ? w->pos : 0; }
-uint64_t lc_lci_raw_bytes(const LCIntermediateWriter *w) { return w ? w->raw_bytes : 0; }
+uint64_t lc_lci_bytes_written(const LCIntermediateWriter *w)
+{
+    if (!w) return 0;
+    pthread_mutex_lock((pthread_mutex_t *)&w->mu);
+    uint64_t v = w->pos;
+    pthread_mutex_unlock((pthread_mutex_t *)&w->mu);
+    return v;
+}
+
+uint64_t lc_lci_raw_bytes(const LCIntermediateWriter *w)
+{
+    if (!w) return 0;
+    pthread_mutex_lock((pthread_mutex_t *)&w->mu);
+    uint64_t v = w->raw_bytes;
+    pthread_mutex_unlock((pthread_mutex_t *)&w->mu);
+    return v;
+}
 
 /* ------------------------------------------------------------------------ */
 /* Reader                                                                    */
@@ -394,7 +466,7 @@ static int reader_scan(LCIReader *r, uint64_t start, uint64_t file_size)
         LCIChunkHeader h;
         if (fseeko(r->f, (off_t)pos, SEEK_SET) != 0) break;
         if (fread(&h, sizeof(h), 1, r->f) != 1) break;
-        if (h.type != 'V' && h.type != 'A') break;   /* trailer or garbage */
+        if (h.type != 'V' && h.type != 'A') break;   /* trailer, garbage or a hole left by a crash */
         if (pos + sizeof(h) + h.size > file_size) break; /* truncated chunk */
         if (r->count == cap) {
             size_t ncap = cap ? cap * 2 : 4096;
@@ -487,4 +559,30 @@ void lci_reader_close(LCIReader *r)
     free(r->extradata);
     free(r->entries);
     free(r);
+}
+
+int lc_lci_probe(const char *path, LCIntermediateConfig *cfg, LCIntermediateProbe *probe, char *err, size_t errlen)
+{
+    LCIReader *r = lci_reader_open(path, err, errlen);
+    if (!r) return -1;
+    LCIntermediateProbe p;
+    memset(&p, 0, sizeof(p));
+    p.first_video_pts_ns = INT64_MAX;
+    p.last_video_pts_ns = INT64_MIN;
+    for (size_t i = 0; i < r->count; i++) {
+        const LCIChunkHeader *h = &r->entries[i].hdr;
+        if (h->type == 'V') {
+            p.video_frames++;
+            if (h->pts_ns < p.first_video_pts_ns) p.first_video_pts_ns = h->pts_ns;
+            if (h->pts_ns > p.last_video_pts_ns) p.last_video_pts_ns = h->pts_ns;
+        } else if (h->type == 'A') {
+            p.audio_frames += (int64_t)h->aux;
+        }
+    }
+    if (p.video_frames == 0) { p.first_video_pts_ns = 0; p.last_video_pts_ns = 0; }
+    p.recovered_without_trailer = r->recovered;
+    if (cfg) *cfg = r->cfg;
+    if (probe) *probe = p;
+    lci_reader_close(r);
+    return 0;
 }

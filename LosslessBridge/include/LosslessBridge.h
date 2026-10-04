@@ -14,6 +14,12 @@
  * thread at a time. The hash helpers and repack functions are pure and
  * reentrant. lc_lci_append_* are serialised internally so worker threads
  * may call them concurrently.
+ *
+ * Job control flags: the long-running calls (stage-2 transcode, verification)
+ * take a `volatile int *control` that the caller may change at any time:
+ * 0 = run, 1 = cancel (the call returns at the next frame boundary),
+ * 2 = pause (the call sleeps at the next frame boundary until the value
+ * changes). The intermediate and hash list stay consistent in every case.
  */
 #ifndef LOSSLESS_BRIDGE_H
 #define LOSSLESS_BRIDGE_H
@@ -215,7 +221,12 @@ typedef struct {
 
 LCHashListWriter *lc_hashlist_open(const char *path, const LCHashListHeader *hdr,
                                    char *err, size_t errlen);
-/** Reopen an existing list to append audio records (two-stage: stage 2 commits the audio). */
+/**
+ * Reopen an existing list to append audio records (two-stage: stage 2 commits
+ * the audio). Records left by an earlier, unfinished or repeated stage 2 are
+ * removed first, so the list always holds exactly one audio series.
+ * lc_hashlist_abort() on such a writer truncates back to the capture-time list.
+ */
 LCHashListWriter *lc_hashlist_open_append(const char *path, char *err, size_t errlen);
 /** Writes only the audio totals record ('F') and closes. */
 int lc_hashlist_close_audio(LCHashListWriter *w, int64_t total_audio_frames, uint64_t final_audio_hash);
@@ -242,6 +253,7 @@ typedef struct {
     int64_t   total_audio_frames;
     uint64_t  final_audio_hash;
     int32_t   complete;         /* trailer present */
+    int32_t   audio_final_present; /* a committed audio-stream digest exists (real-time, or stage 2 finished) */
 } LCHashList;
 
 LCHashList *lc_hashlist_load(const char *path, char *err, size_t errlen);
@@ -376,10 +388,23 @@ int lc_lci_append_video(LCIntermediateWriter *w, int64_t frame_index, int64_t pt
 /** Thread-safe. Interleaved int32 top-aligned 24-bit samples. */
 int lc_lci_append_audio(LCIntermediateWriter *w, int64_t pts_ns,
                         const int32_t *samples, int nb_frames);
+/** Waits for in-flight appends, writes the chunk table, syncs and frees. */
 int lc_lci_close(LCIntermediateWriter *w);
 void lc_lci_abort(LCIntermediateWriter *w);
 uint64_t lc_lci_bytes_written(const LCIntermediateWriter *w);
 uint64_t lc_lci_raw_bytes(const LCIntermediateWriter *w);
+
+typedef struct {
+    int64_t video_frames;
+    int64_t audio_frames;
+    int64_t first_video_pts_ns;
+    int64_t last_video_pts_ns;
+    int     recovered_without_trailer;   /* 1 = recording was interrupted (no chunk table) */
+} LCIntermediateProbe;
+
+/** Reads the header and chunk table (or scans a crashed file) without decoding. */
+int lc_lci_probe(const char *path, LCIntermediateConfig *cfg, LCIntermediateProbe *probe,
+                 char *err, size_t errlen);
 
 /* ------------------------------------------------------------------------ */
 /* Stage 2: intermediate -> final MKV                                        */
@@ -439,6 +464,7 @@ typedef struct {
     int     crc_errors;             /* FFV1 slice CRC mismatches reported by the decoder */
     int     crc_checked;            /* 1 if the decoder was run with CRC checking */
     double  seconds;
+    int64_t frames_unverified;      /* frames past the end of an incomplete hash list (interrupted recording) */
 } LCVerifyResult;
 
 int lc_verify_recording(const char *mkv_path, const char *hashlist_path, int threads,
@@ -469,6 +495,7 @@ typedef struct {
     int audio_ambisonic;
     int ffv1_version;           /* 0 if not FFV1 / unknown */
     int ffv1_slicecrc;          /* 1 if the stream carries slice CRCs (FFV1 v3 default) */
+    int finalized;              /* 0 = file was not closed properly (index rebuilt by scanning) */
 } LCMediaInfo;
 
 typedef struct {
@@ -493,6 +520,12 @@ int lc_decoder_seek_time(LCDecoder *d, int64_t pts_ns);
 int64_t lc_decoder_frame_pts(const LCDecoder *d, int64_t frame_index);
 /** Nearest frame index for a presentation time. */
 int64_t lc_decoder_frame_index_for_pts(const LCDecoder *d, int64_t pts_ns);
+/**
+ * Timeline gaps in the video index: the number of places where consecutive
+ * frames are more than 1.5 nominal frame durations apart, and the number of
+ * frame slots those gaps span (i.e. frames dropped during capture).
+ */
+void lc_decoder_timeline_stats(const LCDecoder *d, int64_t *gap_count, int64_t *missing_frames);
 /**
  * Decode audio into `out` (interleaved int32 top-aligned 24-bit, capacity
  * `max_frames` sample frames). Returns frames produced, 0 at EOF, <0 error.

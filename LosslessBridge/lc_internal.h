@@ -46,6 +46,10 @@ static inline const char *lc_averr(int e, char *buf, size_t len)
 
 int lc_cpu_count(void);
 
+/* Job control (see LosslessBridge.h): returns 1 when the caller asked to
+ * cancel; sleeps while the flag says pause. */
+int lc_job_should_stop(volatile int *control);
+
 /* FFmpeg pixel format mapping. */
 enum AVPixelFormat lc_to_av_pixfmt(LCPixelFormat f);
 int lc_from_av_pixfmt(enum AVPixelFormat f, LCPixelFormat *out);
