@@ -26,10 +26,12 @@ final class ReferenceRecorder: NSObject, AVCaptureFileOutputRecordingDelegate {
     private let writerQueue = DispatchQueue(label: "com.losslesscam.reference")
     private var audioFormatHint: CMFormatDescription?
     private var droppedByWriter: Int64 = 0
+    private var writerSetupError: String?
 
     private var stopCompletion: ((URL?, String?) -> Void)?
     private var movieURL: URL?
     private var active = false
+    private var lastMovieError: String?
 
     var pathDescription: String {
         switch path {
@@ -40,16 +42,20 @@ final class ReferenceRecorder: NSObject, AVCaptureFileOutputRecordingDelegate {
     }
 
     /// Called inside the session's begin/commitConfiguration block.
-    func configure(session: AVCaptureSession, settings: CaptureSettings, formatOption: FormatOption) {
+    /// `allowMovieOutput` is false when the capture manager has had to move the reference
+    /// out of the session (recovery ladder / safe mode); `stabilization` is the mode applied
+    /// to the lossless data output, mirrored here so both outputs see identical geometry.
+    func configure(session: AVCaptureSession, settings: CaptureSettings, formatOption: FormatOption,
+                   allowMovieOutput: Bool, stabilization: AVCaptureVideoStabilizationMode) {
         self.session = session
         self.settings = settings
         self.option = formatOption
-        let wantMovie = settings.referenceRecorder == .auto || settings.referenceRecorder == .movieFileOutput
         if settings.referenceRecorder == .off {
             removeMovieOutput(from: session)
             path = .off
             return
         }
+        let wantMovie = allowMovieOutput && (settings.referenceRecorder == .auto || settings.referenceRecorder == .movieFileOutput)
         if wantMovie {
             if movieOutput == nil {
                 let out = AVCaptureMovieFileOutput()
@@ -57,6 +63,8 @@ final class ReferenceRecorder: NSObject, AVCaptureFileOutputRecordingDelegate {
                 if session.canAddOutput(out) {
                     session.addOutput(out)
                     movieOutput = out
+                } else {
+                    DiagnosticsLog.shared.log("reference", "Session refused AVCaptureMovieFileOutput (canAddOutput == false)")
                 }
             }
             if let out = movieOutput, let conn = out.connection(with: .video) {
@@ -64,7 +72,7 @@ final class ReferenceRecorder: NSObject, AVCaptureFileOutputRecordingDelegate {
                     out.setOutputSettings([AVVideoCodecKey: AVVideoCodecType.hevc], for: conn)
                 }
                 if conn.isVideoStabilizationSupported {
-                    conn.preferredVideoStabilizationMode = formatOption.stabilization[settings.stabilization] == true ? settings.stabilization.avMode : .off
+                    conn.preferredVideoStabilizationMode = stabilization
                 }
                 path = .movieFileOutput
                 return
@@ -85,15 +93,26 @@ final class ReferenceRecorder: NSObject, AVCaptureFileOutputRecordingDelegate {
         movieOutput = nil
     }
 
+    /// Forgets the session's outputs after the capture manager tore the session down.
+    func detach() {
+        movieOutput = nil
+        path = .off
+    }
+
     // MARK: Start / stop
 
     func start(url: URL, firstFrameHint: CMSampleBuffer?) {
         active = true
         droppedByWriter = 0
+        lastMovieError = nil
         switch path {
         case .movieFileOutput:
             movieURL = url
-            movieOutput?.startRecording(to: url, recordingDelegate: self)
+            guard let out = movieOutput, let session = session, session.isRunning else {
+                lastMovieError = "MovieFileOutput unavailable or session not running"
+                return
+            }
+            out.startRecording(to: url, recordingDelegate: self)
         case .assetWriter:
             writerQueue.async { self.setupWriter(url: url) }
         case .off:
@@ -109,7 +128,7 @@ final class ReferenceRecorder: NSObject, AVCaptureFileOutputRecordingDelegate {
                 stopCompletion = completion
                 out.stopRecording()
             } else {
-                completion(nil, "MovieFileOutput was not recording")
+                completion(nil, lastMovieError ?? "MovieFileOutput was not recording")
             }
         case .assetWriter:
             writerQueue.async { self.finishWriter(completion: completion) }
@@ -125,7 +144,8 @@ final class ReferenceRecorder: NSObject, AVCaptureFileOutputRecordingDelegate {
         if let error = error as NSError? {
             // A "recording finished successfully" flag accompanies some non-fatal errors.
             let ok = (error.userInfo[AVErrorRecordingSuccessfullyFinishedKey] as? Bool) ?? false
-            if !ok { message = error.localizedDescription }
+            DiagnosticsLog.shared.log("reference", "MovieFileOutput finished with \(DiagnosticsLog.describe(error)) successfullyFinished=\(ok)")
+            if !ok { message = DiagnosticsLog.shortLabel(error) }
         }
         completion?(FileManager.default.fileExists(atPath: outputFileURL.path) ? outputFileURL : nil, message)
     }
@@ -146,75 +166,82 @@ final class ReferenceRecorder: NSObject, AVCaptureFileOutputRecordingDelegate {
     private func setupWriter(url: URL) {
         guard let option = option else { return }
         try? FileManager.default.removeItem(at: url)
-        do {
-            let w = try AVAssetWriter(outputURL: url, fileType: .mov)
-            let fps = settings.frameRate.rawValue
-            let pixels = Double(option.width) * Double(option.height)
-            // Camera-app-like bit rates: ~ 0.1 bit/pixel/frame at 4K60 HEVC 10-bit.
-            let bitrate = Int(pixels * Double(fps) * (option.is10Bit ? 0.11 : 0.08))
-            var compression: [String: Any] = [
-                AVVideoAverageBitRateKey: bitrate,
-                AVVideoExpectedSourceFrameRateKey: fps,
-                AVVideoMaxKeyFrameIntervalKey: fps,
-                AVVideoAllowFrameReorderingKey: true
-            ]
-            var videoSettings: [String: Any] = [
-                AVVideoCodecKey: AVVideoCodecType.hevc,
-                AVVideoWidthKey: Int(option.width),
-                AVVideoHeightKey: Int(option.height)
-            ]
-            if option.is10Bit && settings.hdr {
-                compression[AVVideoProfileLevelKey] = kVTProfileLevel_HEVC_Main10_AutoLevel as String
-                compression[kVTCompressionPropertyKey_HDRMetadataInsertionMode as String] = kVTHDRMetadataInsertionMode_Auto as String
-                videoSettings[AVVideoColorPropertiesKey] = [
-                    AVVideoColorPrimariesKey: AVVideoColorPrimaries_ITU_R_2020,
-                    AVVideoTransferFunctionKey: AVVideoTransferFunction_ITU_R_2100_HLG,
-                    AVVideoYCbCrMatrixKey: AVVideoYCbCrMatrix_ITU_R_2020
+        writerSetupError = nil
+        let exception = LCCatchObjCException {
+            do {
+                let w = try AVAssetWriter(outputURL: url, fileType: .mov)
+                let fps = self.settings.frameRate.rawValue
+                let pixels = Double(option.width) * Double(option.height)
+                // Camera-app-like bit rates: ~ 0.1 bit/pixel/frame at 4K60 HEVC 10-bit.
+                let bitrate = Int(pixels * Double(fps) * (option.is10Bit ? 0.11 : 0.08))
+                var compression: [String: Any] = [
+                    AVVideoAverageBitRateKey: bitrate,
+                    AVVideoExpectedSourceFrameRateKey: fps,
+                    AVVideoMaxKeyFrameIntervalKey: fps,
+                    AVVideoAllowFrameReorderingKey: true
                 ]
-            } else {
-                compression[AVVideoProfileLevelKey] = kVTProfileLevel_HEVC_Main_AutoLevel as String
-                videoSettings[AVVideoColorPropertiesKey] = [
-                    AVVideoColorPrimariesKey: AVVideoColorPrimaries_ITU_R_709_2,
-                    AVVideoTransferFunctionKey: AVVideoTransferFunction_ITU_R_709_2,
-                    AVVideoYCbCrMatrixKey: AVVideoYCbCrMatrix_ITU_R_709_2
+                var videoSettings: [String: Any] = [
+                    AVVideoCodecKey: AVVideoCodecType.hevc,
+                    AVVideoWidthKey: Int(option.width),
+                    AVVideoHeightKey: Int(option.height)
                 ]
-            }
-            videoSettings[AVVideoCompressionPropertiesKey] = compression
-            let vi = AVAssetWriterInput(mediaType: .video, outputSettings: videoSettings)
-            vi.expectsMediaDataInRealTime = true
-            guard w.canAdd(vi) else { return }
-            w.add(vi)
-
-            var ai: AVAssetWriterInput? = nil
-            if let hint = audioFormatHint {
-                let asbd = CMAudioFormatDescriptionGetStreamBasicDescription(hint)?.pointee
-                let channels = Int(asbd?.mChannelsPerFrame ?? 2)
-                let rate = asbd?.mSampleRate ?? 48000
-                var audioSettings: [String: Any] = [
-                    AVFormatIDKey: kAudioFormatMPEG4AAC,
-                    AVSampleRateKey: rate,
-                    AVNumberOfChannelsKey: min(channels, 2),
-                    AVEncoderBitRateKey: 256_000
-                ]
-                if channels > 2 {
-                    // AAC reference audio is a stereo monitor mix; the lossless file keeps all channels.
-                    audioSettings[AVNumberOfChannelsKey] = 2
+                if option.is10Bit && self.settings.hdr {
+                    compression[AVVideoProfileLevelKey] = kVTProfileLevel_HEVC_Main10_AutoLevel as String
+                    compression[kVTCompressionPropertyKey_HDRMetadataInsertionMode as String] = kVTHDRMetadataInsertionMode_Auto as String
+                    videoSettings[AVVideoColorPropertiesKey] = [
+                        AVVideoColorPrimariesKey: AVVideoColorPrimaries_ITU_R_2020,
+                        AVVideoTransferFunctionKey: AVVideoTransferFunction_ITU_R_2100_HLG,
+                        AVVideoYCbCrMatrixKey: AVVideoYCbCrMatrix_ITU_R_2020
+                    ]
+                } else {
+                    compression[AVVideoProfileLevelKey] = kVTProfileLevel_HEVC_Main_AutoLevel as String
+                    videoSettings[AVVideoColorPropertiesKey] = [
+                        AVVideoColorPrimariesKey: AVVideoColorPrimaries_ITU_R_709_2,
+                        AVVideoTransferFunctionKey: AVVideoTransferFunction_ITU_R_709_2,
+                        AVVideoYCbCrMatrixKey: AVVideoYCbCrMatrix_ITU_R_709_2
+                    ]
                 }
-                let input = AVAssetWriterInput(mediaType: .audio, outputSettings: audioSettings, sourceFormatHint: channels > 2 ? nil : hint)
-                input.expectsMediaDataInRealTime = true
-                if w.canAdd(input) { w.add(input); ai = input }
+                videoSettings[AVVideoCompressionPropertiesKey] = compression
+                let vi = AVAssetWriterInput(mediaType: .video, outputSettings: videoSettings)
+                vi.expectsMediaDataInRealTime = true
+                guard w.canAdd(vi) else { self.writerSetupError = "AVAssetWriter refused the HEVC video input"; return }
+                w.add(vi)
+
+                var ai: AVAssetWriterInput? = nil
+                if let hint = self.audioFormatHint {
+                    let asbd = CMAudioFormatDescriptionGetStreamBasicDescription(hint)?.pointee
+                    let channels = Int(asbd?.mChannelsPerFrame ?? 2)
+                    let rate = asbd?.mSampleRate ?? 48000
+                    // AAC reference audio is a stereo monitor mix; the lossless file keeps all channels.
+                    let audioSettings: [String: Any] = [
+                        AVFormatIDKey: kAudioFormatMPEG4AAC,
+                        AVSampleRateKey: rate,
+                        AVNumberOfChannelsKey: min(channels, 2),
+                        AVEncoderBitRateKey: 256_000
+                    ]
+                    let input = AVAssetWriterInput(mediaType: .audio, outputSettings: audioSettings, sourceFormatHint: channels > 2 ? nil : hint)
+                    input.expectsMediaDataInRealTime = true
+                    if w.canAdd(input) { w.add(input); ai = input }
+                }
+                self.writer = w
+                self.videoInput = vi
+                self.audioInput = ai
+                self.writerStarted = false
+                self.writerURL = url
+                if !w.startWriting() {
+                    self.writerSetupError = "AVAssetWriter.startWriting failed: \(DiagnosticsLog.describe(w.error))"
+                    self.writer = nil
+                }
+            } catch {
+                self.writerSetupError = "AVAssetWriter: \(error.localizedDescription)"
+                self.writer = nil
             }
-            writer = w
-            videoInput = vi
-            audioInput = ai
-            writerStarted = false
-            writerURL = url
-            if !w.startWriting() {
-                writer = nil
-            }
-        } catch {
+        }
+        if let ex = exception {
+            writerSetupError = "AVAssetWriter setup raised \(ex)"
             writer = nil
         }
+        if let e = writerSetupError { DiagnosticsLog.shared.log("reference", e) }
     }
 
     private func appendOnQueue(_ sb: CMSampleBuffer, isVideo: Bool) {
@@ -225,31 +252,38 @@ final class ReferenceRecorder: NSObject, AVCaptureFileOutputRecordingDelegate {
             w.startSession(atSourceTime: pts)
             writerStarted = true
         }
-        if isVideo {
-            if let vi = videoInput, vi.isReadyForMoreMediaData {
-                if !vi.append(sb) { droppedByWriter += 1 }
-            } else {
-                droppedByWriter += 1
+        let exception = LCCatchObjCException {
+            if isVideo {
+                if let vi = self.videoInput, vi.isReadyForMoreMediaData {
+                    if !vi.append(sb) { self.droppedByWriter += 1 }
+                } else {
+                    self.droppedByWriter += 1
+                }
+            } else if let ai = self.audioInput, ai.isReadyForMoreMediaData {
+                let channels = CMSampleBufferGetFormatDescription(sb).flatMap { CMAudioFormatDescriptionGetStreamBasicDescription($0)?.pointee.mChannelsPerFrame } ?? 2
+                if channels <= 2 { _ = ai.append(sb) }
             }
-        } else if let ai = audioInput, ai.isReadyForMoreMediaData {
-            if (CMSampleBufferGetFormatDescription(sb).flatMap { CMAudioFormatDescriptionGetStreamBasicDescription($0)?.pointee.mChannelsPerFrame } ?? 2) <= 2 {
-                _ = ai.append(sb)
-            }
+        }
+        if let ex = exception {
+            DiagnosticsLog.shared.log("reference", "AVAssetWriter append raised \(ex); reference recording aborted")
+            w.cancelWriting()
+            writer = nil
+            writerSetupError = "AVAssetWriter append raised \(ex)"
         }
     }
 
     private func finishWriter(completion: @escaping (URL?, String?) -> Void) {
         guard let w = writer else {
-            completion(nil, "AVAssetWriter was not running")
+            completion(nil, writerSetupError ?? "AVAssetWriter was not running")
             return
         }
         let url = writerURL
         let dropped = droppedByWriter
-        videoInput?.markAsFinished()
-        audioInput?.markAsFinished()
         if w.status == .writing && writerStarted {
+            videoInput?.markAsFinished()
+            audioInput?.markAsFinished()
             w.finishWriting {
-                let err = w.error?.localizedDescription
+                let err = w.error.map { DiagnosticsLog.shortLabel($0) }
                 let note = dropped > 0 ? "AVAssetWriter reference skipped \(dropped) frames (encoder back-pressure)" : nil
                 completion(w.status == .completed ? url : nil, err ?? note)
                 self.writer = nil
@@ -257,7 +291,7 @@ final class ReferenceRecorder: NSObject, AVCaptureFileOutputRecordingDelegate {
         } else {
             w.cancelWriting()
             writer = nil
-            completion(nil, "AVAssetWriter never received a video frame")
+            completion(nil, w.status == .failed ? "AVAssetWriter failed: \(DiagnosticsLog.describe(w.error))" : "AVAssetWriter never received a video frame")
         }
     }
 }

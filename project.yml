@@ -64,6 +64,7 @@ targets:
         OTHER_CFLAGS:
           - -fno-strict-aliasing
           - -Wno-deprecated-declarations
+        CLANG_ENABLE_OBJC_ARC: YES
         SKIP_INSTALL: YES
 
   LosslessCam:
@@ -85,6 +86,7 @@ targets:
       - sdk: MetalKit.framework
       - sdk: Accelerate.framework
       - sdk: QuartzCore.framework
+      - sdk: Foundation.framework
       - sdk: libcompression.tbd
       - sdk: libbz2.tbd
       - sdk: libz.tbd
