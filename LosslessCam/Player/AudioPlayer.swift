@@ -14,9 +14,10 @@ final class AudioPlayer {
     private let node = AVAudioPlayerNode()
     private let format: AVAudioFormat
     private let queue = DispatchQueue(label: "com.losslesscam.audioplayer", qos: .userInteractive)
-    private let inflight = DispatchSemaphore(value: 6)
+    private let cond = NSCondition()
+    private var inflight = 0
+    private let maxInflight = 6
     private var token = 0
-    private let lock = NSLock()
     private var startPtsNs: Int64 = 0
     private var running = false
     private(set) var reachedEnd = false
@@ -43,17 +44,17 @@ final class AudioPlayer {
         lc_decoder_close(dec)
     }
 
-    var isRunning: Bool { lock.lock(); defer { lock.unlock() }; return running }
+    var isRunning: Bool { cond.lock(); defer { cond.unlock() }; return running }
 
     func start(at ptsNs: Int64) {
         stop()
-        lock.lock()
+        cond.lock()
         token += 1
         let myToken = token
         running = true
         reachedEnd = false
         startPtsNs = max(ptsNs, 0)
-        lock.unlock()
+        cond.unlock()
         let session = AVAudioSession.sharedInstance()
         try? session.setCategory(.playback, mode: .moviePlayback, options: [])
         try? session.setActive(true)
@@ -63,25 +64,19 @@ final class AudioPlayer {
         queue.async { [self] in self.feedLoop(token: myToken) }
     }
 
+    /// Safe to call from any thread, including the feed queue itself.
     func stop() {
-        lock.lock()
+        cond.lock()
         running = false
         token += 1
-        lock.unlock()
+        cond.broadcast()
+        cond.unlock()
         node.stop()
-        // Release any producer waiting for a slot.
-        for _ in 0..<6 { inflight.signal() }
-        // Re-arm the semaphore to its nominal capacity.
-        queue.sync {
-            var n = 0
-            while inflight.wait(timeout: .now()) == .success { n += 1 }
-            for _ in 0..<6 { inflight.signal() }
-        }
     }
 
     /// Current playback position derived from the audio hardware clock.
     func currentTimeNs() -> Int64? {
-        lock.lock(); let r = running; let start = startPtsNs; lock.unlock()
+        cond.lock(); let r = running; let start = startPtsNs; cond.unlock()
         guard r, let nt = node.lastRenderTime, let pt = node.playerTime(forNodeTime: nt) else { return nil }
         return start + Int64(Double(pt.sampleTime) * 1e9 / Double(sampleRate))
     }
@@ -90,19 +85,24 @@ final class AudioPlayer {
         let chunk = 4096
         var buf = [Int32](repeating: 0, count: chunk * channels)
         while true {
-            lock.lock(); let ok = running && token == myToken; lock.unlock()
+            // Wait for a free slot (bounded number of scheduled buffers).
+            cond.lock()
+            while running && token == myToken && inflight >= maxInflight { cond.wait() }
+            let ok = running && token == myToken
+            if ok { inflight += 1 }
+            cond.unlock()
             if !ok { return }
-            inflight.wait()
-            lock.lock(); let still = running && token == myToken; lock.unlock()
-            if !still { inflight.signal(); return }
+
             var pts: Int64 = 0
             let n = buf.withUnsafeMutableBufferPointer { p in lc_decoder_next_audio(dec, p.baseAddress, Int32(chunk), &pts) }
             if n <= 0 {
-                inflight.signal()
-                lock.lock(); reachedEnd = true; lock.unlock()
+                cond.lock(); inflight -= 1; reachedEnd = true; cond.unlock()
                 return
             }
-            guard let out = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: AVAudioFrameCount(n)) else { inflight.signal(); return }
+            guard let out = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: AVAudioFrameCount(n)) else {
+                cond.lock(); inflight -= 1; cond.unlock()
+                return
+            }
             out.frameLength = AVAudioFrameCount(n)
             let l = out.floatChannelData![0], r = out.floatChannelData![1]
             let scale: Float = 1.0 / 2147483648.0
@@ -122,7 +122,10 @@ final class AudioPlayer {
                     r[i] = Float(buf[base + 1]) * scale
                 }
             }
-            node.scheduleBuffer(out) { [weak self] in self?.inflight.signal() }
+            node.scheduleBuffer(out) { [weak self] in
+                guard let self = self else { return }
+                self.cond.lock(); self.inflight -= 1; self.cond.signal(); self.cond.unlock()
+            }
         }
     }
 }

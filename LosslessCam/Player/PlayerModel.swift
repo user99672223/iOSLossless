@@ -74,12 +74,21 @@ final class PlayerModel: ObservableObject {
     private let lock = NSLock()
     private var fpsEMA: Double = 0
 
-    init?(url: URL) {
-        guard let s = makeFrameSource(url: url) else { return nil }
+    /// Opens the decoders off the main thread, then builds the model (which owns a UIView) on main.
+    static func load(url: URL, completion: @escaping (PlayerModel?) -> Void) {
+        DispatchQueue.global(qos: .userInitiated).async {
+            guard let source = makeFrameSource(url: url) else { DispatchQueue.main.async { completion(nil) }; return }
+            let audio = source.info.audioCodec != nil ? AudioPlayer(url: url) : nil
+            DispatchQueue.main.async { completion(PlayerModel(source: source, audio: audio, url: url)) }
+        }
+    }
+
+    /// Must be called on the main thread (creates the Metal view).
+    init(source s: FrameSource, audio a: AudioPlayer?, url: URL) {
         source = s
         info = s.info
         self.url = url
-        if s.info.audioCodec != nil, let a = AudioPlayer(url: url) {
+        if let a = a {
             audio = a
             hasAudio = true
             audioChannelsLabel = a.ambisonic ? "\(a.channels) ch first-order ambisonics → stereo decode" : "\(a.channels) ch"

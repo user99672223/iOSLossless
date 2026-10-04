@@ -30,6 +30,7 @@ struct RootView: View {
     @EnvironmentObject var capture: CaptureManager
     @EnvironmentObject var library: LibraryStore
     @State private var tab = 0
+    @State private var resumedPending = false
 
     var body: some View {
         TabView(selection: $tab) {
@@ -47,7 +48,13 @@ struct RootView: View {
         .task {
             await capture.requestPermissions()
             capture.configure(settings: settings.settings)
-            Stage2Runner.shared.resumePending(recordings: library.recordings, ffv1: settings.settings.ffv1Params, flacLevel: settings.settings.flacCompressionLevel)
+        }
+        .onReceive(library.$scanning) { scanning in
+            // Resume interrupted stage-2 jobs once the first library scan has completed.
+            if !scanning, !resumedPending, !library.recordings.isEmpty {
+                resumedPending = true
+                Stage2Runner.shared.resumePending(recordings: library.recordings, ffv1: settings.settings.ffv1Params, flacLevel: settings.settings.flacCompressionLevel)
+            }
         }
     }
 }

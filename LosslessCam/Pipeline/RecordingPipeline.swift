@@ -203,11 +203,12 @@ final class RecordingPipeline: ObservableObject {
     func ingestVideo(_ sb: CMSampleBuffer) {
         guard let pb = CMSampleBufferGetImageBuffer(sb) else { return }
         let now = CACurrentMediaTime()
-        if now - lastBenchmarkFrameTime > 1.0 {
+        lock.lock()
+        if !recording && now - lastBenchmarkFrameTime > 1.0 {
+            // Preview only: never hold an extra camera pool buffer while recording.
             lastBenchmarkFrameTime = now
             latestFrameForBenchmark = pb
         }
-        lock.lock()
         guard recording, let cfg = config, let ring = ring else { lock.unlock(); return }
         let pts = CMSampleBufferGetPresentationTimeStamp(sb)
         let ptsNs = Int64(CMTimeConvertScale(pts, timescale: 1_000_000_000, method: .default).value)

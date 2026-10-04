@@ -11,13 +11,13 @@ struct PlayerView: View {
     final class ModelHolder: ObservableObject {
         @Published var model: PlayerModel?
         @Published var error: String?
+        private var loading = false
         func load(url: URL) {
-            guard model == nil, error == nil else { return }
-            DispatchQueue.global(qos: .userInitiated).async {
-                let m = PlayerModel(url: url)
-                DispatchQueue.main.async {
-                    if let m = m { self.model = m } else { self.error = "Could not open \(url.lastPathComponent)" }
-                }
+            guard model == nil, error == nil, !loading else { return }
+            loading = true
+            PlayerModel.load(url: url) { m in
+                self.loading = false
+                if let m = m { self.model = m } else { self.error = "Could not open \(url.lastPathComponent)" }
             }
         }
     }

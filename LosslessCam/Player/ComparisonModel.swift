@@ -51,8 +51,19 @@ final class ComparisonModel: ObservableObject {
     private var measured = 0
     private var fpsEMA: Double = 0
 
-    init?(urlA: URL, urlB: URL) {
-        guard let sa = makeFrameSource(url: urlA), let sb = makeFrameSource(url: urlB) else { return nil }
+    /// Opens both decoders off the main thread, then builds the model (which owns a UIView) on main.
+    static func load(urlA: URL, urlB: URL, completion: @escaping (ComparisonModel?) -> Void) {
+        DispatchQueue.global(qos: .userInitiated).async {
+            guard let sa = makeFrameSource(url: urlA), let sb = makeFrameSource(url: urlB) else {
+                DispatchQueue.main.async { completion(nil) }
+                return
+            }
+            DispatchQueue.main.async { completion(ComparisonModel(sourceA: sa, sourceB: sb, urlA: urlA, urlB: urlB)) }
+        }
+    }
+
+    /// Must be called on the main thread (creates the Metal view).
+    init(sourceA sa: FrameSource, sourceB sb: FrameSource, urlA: URL, urlB: URL) {
         a = sa; b = sb
         infoA = sa.info; infoB = sb.info
         nameA = urlA.lastPathComponent

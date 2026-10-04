@@ -12,13 +12,13 @@ struct ComparisonView: View {
     final class Holder: ObservableObject {
         @Published var model: ComparisonModel?
         @Published var error: String?
+        private var loading = false
         func load(a: URL, b: URL) {
-            guard model == nil, error == nil else { return }
-            DispatchQueue.global(qos: .userInitiated).async {
-                let m = ComparisonModel(urlA: a, urlB: b)
-                DispatchQueue.main.async {
-                    if let m = m { self.model = m } else { self.error = "Could not open one of the files" }
-                }
+            guard model == nil, error == nil, !loading else { return }
+            loading = true
+            ComparisonModel.load(urlA: a, urlB: b) { m in
+                self.loading = false
+                if let m = m { self.model = m } else { self.error = "Could not open one of the files" }
             }
         }
     }
