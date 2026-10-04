@@ -346,7 +346,7 @@ final class RecordingPipeline: ObservableObject {
                                    audio_sample_rate: Int32(af?.sampleRate ?? 0), audio_channels: Int32(af?.channels ?? 0),
                                    audio_checkpoint_interval: Int32(af?.sampleRate ?? 48000))
         nextAudioCheckpoint = Int64(af?.sampleRate ?? 48000)
-        hashList = lc_hashlist_open(documentsPath(cfg.baseName + ".lchash"), [hdr], &err, err.count)
+        hashList = lc_hashlist_open(documentsPath(cfg.baseName + ".lchash"), [hdr], &err, 256)
         if hashList == nil { notes.append("Hash list: \(String(cString: err))") }
 
         let ambisonic = (af?.channels == 4 && cfg.settings.audio == .spatial) ? 1 : 0
@@ -364,7 +364,7 @@ final class RecordingPipeline: ObservableObject {
             // Extradata (FFV1 fast) comes from a probe encoder so every worker shares it.
             s1Extradata = []
             if cfg.stage1Codec == .ffv1Fast || cfg.stage1Codec == .utvideo {
-                if let probe = lc_s1_encoder_create(&c, &err, err.count) {
+                if let probe = lc_s1_encoder_create(&c, &err, 256) {
                     var n: Int = 0
                     if let x = lc_s1_encoder_extradata(probe, &n), n > 0 {
                         s1Extradata = Array(UnsafeBufferPointer(start: x, count: n))
@@ -373,7 +373,7 @@ final class RecordingPipeline: ObservableObject {
                 }
             }
             lci = s1Extradata.withUnsafeBufferPointer { xp in
-                lc_lci_open(documentsPath(cfg.baseName + ".lci"), &c, xp.baseAddress, s1Extradata.count, &err, err.count)
+                lc_lci_open(documentsPath(cfg.baseName + ".lci"), &c, xp.baseAddress, s1Extradata.count, &err, 256)
             }
             if lci == nil {
                 notes.append("Intermediate file: \(String(cString: err))")
@@ -403,7 +403,7 @@ final class RecordingPipeline: ObservableObject {
             let mkvPath = documentsPath(cfg.baseName + ".mkv")
             mkv = withCStringArray(meta) { arr -> OpaquePointer? in
                 m.metadata = arr
-                return lc_mkv_open(mkvPath, &m, &err, err.count)
+                return lc_mkv_open(mkvPath, &m, &err, 256)
             }
             if mkv == nil {
                 notes.append("MKV writer: \(String(cString: err))")
@@ -469,7 +469,7 @@ final class RecordingPipeline: ObservableObject {
         c.codec = cfg.stage1Codec.lcCodec
         lock.unlock()
         var err = [CChar](repeating: 0, count: 256)
-        guard let enc = lc_s1_encoder_create(&c, &err, err.count) else {
+        guard let enc = lc_s1_encoder_create(&c, &err, 256) else {
             lock.lock(); notes.append("Worker \(index): \(String(cString: err))"); lock.unlock()
             return
         }

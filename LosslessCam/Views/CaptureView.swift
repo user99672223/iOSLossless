@@ -84,7 +84,7 @@ struct CaptureView: View {
             HStack {
                 Text(capture.activeFormatSummary).font(.caption2).lineLimit(2)
                 Spacer()
-                Text(stateLabel).font(.caption.bold()).foregroundStyle(isRecording ? .red : .secondary)
+                Text(stateLabel).font(.caption.bold()).foregroundStyle(isRecording ? Color.red : Color.secondary)
             }
             HStack {
                 Text("Audio: \(capture.audioModeDescription)").font(.caption2).foregroundStyle(.secondary)
@@ -229,14 +229,14 @@ struct TelemetryOverlay: View {
                     Spacer()
                     Text(String(format: "%.1f fps written · %.1f in", t.achievedFps, t.ingestFps)).font(.caption.monospacedDigit())
                 }
-                row("Dropped", "\(t.droppedFrames) pipeline · \(t.sourceDroppedFrames) source", t.droppedFrames + t.sourceDroppedFrames > 0 ? .red : .primary)
+                row("Dropped", "\(t.droppedFrames) pipeline · \(t.sourceDroppedFrames) source", t.droppedFrames + t.sourceDroppedFrames > 0 ? Color.red : Color.primary)
                 HStack {
                     Text("Buffer").font(.caption2)
-                    ProgressView(value: min(t.bufferFill, 1)).tint(t.bufferFill > 0.8 ? .red : .green)
+                    ProgressView(value: min(t.bufferFill, 1)).tint(t.bufferFill > 0.8 ? Color.red : Color.green)
                     Text("\(Int(t.bufferFill * 100))% (\(t.bufferCount)/\(t.bufferCapacity))").font(.caption2.monospacedDigit())
                 }
                 row("Write", String(format: "%.0f MB/s · %@ · ratio %.2f×", t.writeMBps, t.bytesWritten.byteCountString, t.compressionRatio))
-                row("Thermal", t.thermalLabel, t.thermalState.rawValue >= 2 ? .orange : .primary)
+                row("Thermal", t.thermalLabel, t.thermalState.rawValue >= 2 ? Color.orange : Color.primary)
                 row("Free", "\(t.freeStorageBytes.byteCountString) · ~\(t.estimatedRemainingSeconds.durationString) left at this rate")
                 row("Audio", "\(t.audioFormat) · \(t.audioFrames) frames" + (t.audioInexactSamples > 0 ? " · \(t.audioInexactSamples) inexact" : ""))
                 row("Stage 1", "\(t.stage1Codec) · \(t.workerCount) workers · mem \(t.availableMemoryBytes.byteCountString)" + (t.memoryWarnings > 0 ? " · \(t.memoryWarnings) mem warnings" : ""))

@@ -73,8 +73,7 @@ targets:
       - path: LosslessCam
         excludes:
           - "**/.DS_Store"
-    info:
-      path: LosslessCam/Info.plist
+          - "Info.plist"
     dependencies:
       - target: LosslessBridge
         embed: false

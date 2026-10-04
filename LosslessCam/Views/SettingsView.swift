@@ -200,7 +200,7 @@ struct SettingsView: View {
                         Text(j.kind.rawValue).font(.caption2).foregroundStyle(.secondary)
                     }
                     if !j.finished { ProgressView(value: j.progress) }
-                    Text(j.phase).font(.caption2).foregroundStyle(j.error == nil ? .secondary : .red)
+                    Text(j.phase).font(.caption2).foregroundStyle(j.error == nil ? Color.secondary : Color.red)
                 }
             }
         }

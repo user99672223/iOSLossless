@@ -159,7 +159,7 @@ final class Stage2Runner: ObservableObject {
             withCStringArray(metadata) { meta in
                 lc_transcode_intermediate(lci.path, mkvPath, &params, Int32(flacLevel), meta,
                                           rec.hashListURL.path, Int32(rec.audio?.sampleRate ?? 48000),
-                                          progressCallback, Unmanaged.passUnretained(box).toOpaque(), flag, &stats, &err, err.count)
+                                          progressCallback, Unmanaged.passUnretained(box).toOpaque(), flag, &stats, &err, 512)
             }
         }
         let seconds = CACurrentMediaTime() - start
@@ -218,7 +218,7 @@ final class Stage2Runner: ObservableObject {
         var result = LCVerifyResult()
         var err = [CChar](repeating: 0, count: 512)
         let rc: Int32 = withBackgroundTask("verify") {
-            lc_verify_recording(mkv.path, rec.hashListURL.path, 0, progressCallback, Unmanaged.passUnretained(box).toOpaque(), flag, &result, &err, err.count)
+            lc_verify_recording(mkv.path, rec.hashListURL.path, 0, progressCallback, Unmanaged.passUnretained(box).toOpaque(), flag, &result, &err, 512)
         }
         rec = reload(rec)
         var v = Recording.VerificationState()

@@ -23,7 +23,7 @@ final class AudioPlayer {
 
     init?(url: URL) {
         var err = [CChar](repeating: 0, count: 256)
-        guard let d = lc_decoder_open(url.path, 0, 1, 1, &err, err.count) else { return nil }
+        guard let d = lc_decoder_open(url.path, 0, 1, 1, &err, 256) else { return nil }
         var info = LCMediaInfo()
         lc_decoder_get_info(d, &info)
         guard info.has_audio != 0, info.sample_rate > 0, info.channels > 0 else { lc_decoder_close(d); return nil }

@@ -110,20 +110,24 @@ final class ComparisonModel: ObservableObject {
     func seek(to index: Int64) {
         if isPlaying { pause() }
         let idx = min(max(index, 0), frameCount - 1)
-        queueA.async { [self] in self.decodePair(idx, computeMetrics: true) }
+        queueA.async { [self] in self.decodePair(idx, withMetrics: true) }
     }
 
     func step(_ delta: Int64) { seek(to: currentIndex + delta) }
 
-    private func decodePair(_ idx: Int64, computeMetrics: Bool) {
+    private final class FrameBox: @unchecked Sendable { var frame: DecodedFrame? }
+
+    private func decodePair(_ idx: Int64, withMetrics: Bool) {
         let t0 = CACurrentMediaTime()
         let ib = indexB(forA: idx)
-        var fb: DecodedFrame?
+        let box = FrameBox()
         let group = DispatchGroup()
         group.enter()
-        queueB.async { fb = self.b.frame(at: ib); group.leave() }
+        let sourceB = b
+        queueB.async { box.frame = sourceB.frame(at: ib); group.leave() }
         let fa = a.frame(at: idx)
         group.wait()
+        let fb = box.frame
         let dt = CACurrentMediaTime() - t0
         let inst = dt > 0 ? 1 / dt : 0
         fpsEMA = fpsEMA == 0 ? inst : fpsEMA * 0.9 + inst * 0.1
@@ -137,7 +141,7 @@ final class ComparisonModel: ObservableObject {
             self.currentPtsNs = fa.ptsNs
             self.decodeFps = fps
         }
-        if computeMetrics, let fb = fb { computeMetrics(fa, fb) }
+        if withMetrics, let fb = fb { computeMetrics(fa, fb) }
     }
 
     private func playLoop(token: Int, start: Int64) {
@@ -146,7 +150,7 @@ final class ComparisonModel: ObservableObject {
         var idx = start
         while playToken == token && isPlaying {
             if idx >= frameCount { DispatchQueue.main.async { self.isPlaying = false }; break }
-            decodePair(idx, computeMetrics: true)
+            decodePair(idx, withMetrics: true)
             let due = startWall + Double(idx - start + 1) / (fps * speed)
             let now = CACurrentMediaTime()
             if due > now { Thread.sleep(forTimeInterval: due - now) }

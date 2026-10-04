@@ -187,48 +187,58 @@ final class BenchmarkRunner: ObservableObject {
         var writer: OpaquePointer? = nil
         if let path = path {
             try? FileManager.default.removeItem(atPath: path)
-            writer = lc_lci_open(path, &cfgVar, nil, 0, &err, err.count)
+            writer = lc_lci_open(path, &cfgVar, nil, 0, &err, 256)
             if writer == nil { return Measurement(error: "intermediate writer: \(String(cString: err))") }
         }
+        /// Shared accumulator for the worker threads (reference type, lock-protected).
+        final class Totals: @unchecked Sendable {
+            let lock = NSLock()
+            var frames: Int64 = 0
+            var outBytes: Int64 = 0
+            var inBytes: Int64 = 0
+            var error: String?
+            func add(frames f: Int64, out o: Int64, inBytes i: Int64) { lock.lock(); frames += f; outBytes += o; inBytes += i; lock.unlock() }
+            func fail(_ e: String) { lock.lock(); if error == nil { error = e }; lock.unlock() }
+        }
+        let totals = Totals()
         let group = DispatchGroup()
-        let lock = NSLock()
-        var totalFrames: Int64 = 0
-        var totalOut: Int64 = 0
-        var totalIn: Int64 = 0
-        var errorText: String?
         let rawSize = stride * height * 3 / 2
         let deadline = CACurrentMediaTime() + seconds
         let start = CACurrentMediaTime()
+        let frameList = frames
+        let writerRef = writer
+        let cfgCopy = cfgVar
         for w in 0..<workers {
             group.enter()
             let t = Thread {
                 defer { group.leave() }
                 var e = [CChar](repeating: 0, count: 256)
-                var c = cfgVar
-                guard let enc = lc_s1_encoder_create(&c, &e, e.count) else {
-                    lock.lock(); errorText = String(cString: e); lock.unlock()
+                var c = cfgCopy
+                guard let enc = lc_s1_encoder_create(&c, &e, 256) else {
+                    totals.fail(String(cString: e))
                     return
                 }
                 defer { lc_s1_encoder_destroy(enc) }
                 var i = w
                 var n: Int64 = 0, outBytes: Int64 = 0
                 while CACurrentMediaTime() < deadline {
-                    let f = frames[i % frames.count]
+                    let f = frameList[i % frameList.count]
                     var out: UnsafePointer<UInt8>? = nil
                     var size: Int = 0
                     let rc = lc_s1_encoder_compress(enc, f, stride, f + stride * height, stride, &out, &size)
-                    if rc < 0 { lock.lock(); errorText = "compress failed (\(rc))"; lock.unlock(); break }
-                    if let wr = writer, let out = out {
+                    if rc < 0 { totals.fail("compress failed (\(rc))"); break }
+                    if let wr = writerRef, let out = out {
                         let h = lc_hash_bytes(out, min(size, 4096))
                         if lc_lci_append_video(wr, Int64(i), Int64(i) * 16_666_667, h, out, size, rawSize) != 0 {
-                            lock.lock(); errorText = "write failed (disk full?)"; lock.unlock(); break
+                            totals.fail("write failed (disk full?)")
+                            break
                         }
                     }
                     n += 1
                     outBytes += Int64(size)
                     i += workers
                 }
-                lock.lock(); totalFrames += n; totalOut += outBytes; totalIn += n * Int64(rawSize); lock.unlock()
+                totals.add(frames: n, out: outBytes, inBytes: n * Int64(rawSize))
             }
             t.qualityOfService = .userInitiated
             t.start()
@@ -236,8 +246,8 @@ final class BenchmarkRunner: ObservableObject {
         group.wait()
         let elapsed = max(CACurrentMediaTime() - start, 0.001)
         if let wr = writer { _ = lc_lci_close(wr); try? FileManager.default.removeItem(atPath: path!) }
-        if let e = errorText { return Measurement(error: e) }
-        return Measurement(fps: Double(totalFrames) / elapsed, outBytesPerSecond: Double(totalOut) / elapsed,
-                           ratio: totalOut > 0 ? Double(totalIn) / Double(totalOut) : 0, error: nil)
+        if let e = totals.error { return Measurement(error: e) }
+        return Measurement(fps: Double(totals.frames) / elapsed, outBytesPerSecond: Double(totals.outBytes) / elapsed,
+                           ratio: totals.outBytes > 0 ? Double(totals.inBytes) / Double(totals.outBytes) : 0, error: nil)
     }
 }

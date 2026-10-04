@@ -64,11 +64,11 @@ final class CaptureManager: NSObject, ObservableObject {
         super.init()
         lc_bridge_init()
         pipeline.referenceSink = { [weak self] sb, isVideo in self?.reference.append(sampleBuffer: sb, isVideo: isVideo) }
-        observers.append(NotificationCenter.default.addObserver(forName: .AVCaptureSessionRuntimeError, object: session, queue: .main) { [weak self] n in
+        observers.append(NotificationCenter.default.addObserver(forName: AVCaptureSession.runtimeErrorNotification, object: session, queue: .main) { [weak self] n in
             let err = (n.userInfo?[AVCaptureSessionErrorKey] as? NSError)?.localizedDescription ?? "unknown"
             self?.lastError = "Session runtime error: \(err)"
         })
-        observers.append(NotificationCenter.default.addObserver(forName: .AVCaptureSessionWasInterrupted, object: session, queue: .main) { [weak self] _ in
+        observers.append(NotificationCenter.default.addObserver(forName: AVCaptureSession.wasInterruptedNotification, object: session, queue: .main) { [weak self] _ in
             self?.lastError = "Capture session interrupted"
         })
     }

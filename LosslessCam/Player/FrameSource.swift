@@ -116,7 +116,7 @@ final class FFV1FrameSource: FrameSource {
     init?(url: URL) {
         self.url = url
         var err = [CChar](repeating: 0, count: 256)
-        guard let d = lc_decoder_open(url.path, 1, 1, Int32(ProcessInfo.processInfo.activeProcessorCount), &err, err.count) else {
+        guard let d = lc_decoder_open(url.path, 1, 1, Int32(ProcessInfo.processInfo.activeProcessorCount), &err, 256) else {
             return nil
         }
         var li = LCMediaInfo()

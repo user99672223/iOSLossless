@@ -52,7 +52,7 @@ final class LibraryStore: ObservableObject {
     /// Builds minimal metadata for an MKV without a sidecar by probing it.
     static func probe(url: URL) -> Recording? {
         var err = [CChar](repeating: 0, count: 256)
-        guard let dec = lc_decoder_open(url.path, 1, 1, 1, &err, err.count) else { return nil }
+        guard let dec = lc_decoder_open(url.path, 1, 1, 1, &err, 256) else { return nil }
         var info = LCMediaInfo()
         lc_decoder_get_info(dec, &info)
         lc_decoder_close(dec)
@@ -65,15 +65,18 @@ final class LibraryStore: ObservableObject {
         let hasHash = FileManager.default.fileExists(atPath: url.deletingPathExtension().appendingPathExtension("lchash").path)
         let refName = base + "_HEVC.mov"
         let hasRef = FileManager.default.fileExists(atPath: url.deletingLastPathComponent().appendingPathComponent(refName).path)
+        let audioCodec = withUnsafePointer(to: &info.audio_codec) { String(cString: UnsafeRawPointer($0).assumingMemoryBound(to: CChar.self)) }
+        let audioInfo: Recording.AudioInfo? = info.has_audio != 0
+            ? Recording.AudioInfo(sampleRate: Int(info.sample_rate), channels: Int(info.channels), ambisonic: info.audio_ambisonic != 0,
+                                  sourceFormat: audioCodec, inexactSamples: 0, trimmedFrames: 0, discontinuities: 0, silenceFramesInserted: 0)
+            : nil
         var r = Recording(baseName: base, createdAt: created, width: Int(info.width), height: Int(info.height), bitDepth: Int(info.bit_depth),
                           fullRange: info.full_range != 0, fps: fps, hdr: info.color_trc == Int32(LC_COLOR_TRC_ARIB_STD_B67),
                           colorDescription: "primaries \(info.color_primaries) / trc \(info.color_trc) / matrix \(info.colorspace)",
                           pixelFormatFourCC: info.bit_depth == 10 ? "x420" : "420v", captureMode: "imported", stage1Codec: nil,
                           preset: "—", stabilization: "—", frameCount: info.frame_count, droppedFrames: 0, sourceDroppedFrames: 0,
                           durationSeconds: Double(info.duration_ns) / 1e9,
-                          audio: info.has_audio != 0 ? Recording.AudioInfo(sampleRate: Int(info.sample_rate), channels: Int(info.channels), ambisonic: info.audio_ambisonic != 0,
-                                                                            sourceFormat: String(cString: withUnsafePointer(to: &info.audio_codec) { UnsafeRawPointer($0).assumingMemoryBound(to: CChar.self) }),
-                                                                            inexactSamples: 0, trimmedFrames: 0, discontinuities: 0, silenceFramesInserted: 0) : nil,
+                          audio: audioInfo,
                           files: Recording.Files(mkv: url.lastPathComponent, hevcReference: hasRef ? refName : nil, hashList: base + ".lchash", intermediate: nil, thumbnail: nil),
                           stage2: Recording.Stage2State(status: .notNeeded), verification: Recording.VerificationState(status: hasHash ? .notRun : .error, message: hasHash ? nil : "No hash list for this file"),
                           referencePath: "unknown", telemetry: Recording.TelemetrySummary(), lowBitsNonZero: false,
@@ -130,7 +133,7 @@ final class LibraryStore: ObservableObject {
 
     static func renderThumbnail(path: String, colorspace: Int32, width: Int = 320) -> UIImage? {
         var err = [CChar](repeating: 0, count: 256)
-        guard let dec = lc_decoder_open(path, 1, 0, 2, &err, err.count) else { return nil }
+        guard let dec = lc_decoder_open(path, 1, 0, 2, &err, 256) else { return nil }
         defer { lc_decoder_close(dec) }
         var info = LCMediaInfo()
         lc_decoder_get_info(dec, &info)
