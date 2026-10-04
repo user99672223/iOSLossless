@@ -1,0 +1,139 @@
+name: Build IPA
+
+on:
+  push:
+    branches: ["**"]
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  bridge-tests:
+    name: C bridge tests (Linux, host FFmpeg)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build deps
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends liblz4-dev nasm pkg-config
+
+      - name: Cache host FFmpeg
+        id: cache-ffmpeg-host
+        uses: actions/cache@v4
+        with:
+          path: build/ffmpeg-host
+          key: ffmpeg-host-${{ runner.os }}-${{ hashFiles('scripts/build-ffmpeg.sh') }}
+
+      - name: Build host FFmpeg
+        if: steps.cache-ffmpeg-host.outputs.cache-hit != 'true'
+        run: LC_FFMPEG_HOST_BUILD=1 LC_FFMPEG_OUT="$PWD/build/ffmpeg-host" LC_FFMPEG_WORK="$PWD/build/ffmpeg-host-work" scripts/build-ffmpeg.sh
+
+      - name: Run bridge tests
+        run: LC_FFMPEG_OUT="$PWD/build/ffmpeg-host" LC_TEST_OUT="$PWD/build/bridge-test" scripts/test/run-bridge-tests.sh
+
+  build-ipa:
+    name: Unsigned IPA (iOS arm64)
+    runs-on: macos-15
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Select newest Xcode on the runner
+        id: xcode
+        run: |
+          XCODE_APP="$(ls -d /Applications/Xcode_*.app | sort -V | tail -1)"
+          echo "Using $XCODE_APP"
+          sudo xcode-select -s "$XCODE_APP"
+          xcodebuild -version
+          echo "version=$(xcodebuild -version | head -1 | tr ' ' '_')" >> "$GITHUB_OUTPUT"
+          xcrun --sdk iphoneos --show-sdk-version
+
+      - name: Install XcodeGen
+        run: |
+          brew install xcodegen
+          xcodegen --version
+
+      - name: Cache FFmpeg (iOS arm64)
+        id: cache-ffmpeg
+        uses: actions/cache@v4
+        with:
+          path: ThirdParty/ffmpeg
+          key: ffmpeg-ios-${{ steps.xcode.outputs.version }}-${{ hashFiles('scripts/build-ffmpeg.sh') }}
+
+      - name: Build FFmpeg (LGPL, static, iOS arm64)
+        if: steps.cache-ffmpeg.outputs.cache-hit != 'true'
+        run: scripts/build-ffmpeg.sh
+
+      - name: Show FFmpeg build info
+        run: cat ThirdParty/ffmpeg/BUILD_INFO.txt && ls -la ThirdParty/ffmpeg/lib
+
+      - name: Generate Xcode project
+        run: xcodegen generate
+
+      - name: Archive (unsigned)
+        run: |
+          set -o pipefail
+          mkdir -p build
+          xcodebuild archive \
+            -project LosslessCam.xcodeproj \
+            -scheme LosslessCam \
+            -configuration Release \
+            -destination 'generic/platform=iOS' \
+            -archivePath "$PWD/build/LosslessCam.xcarchive" \
+            -skipPackagePluginValidation \
+            -skipMacroValidation \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            DEVELOPMENT_TEAM="" \
+            PROVISIONING_PROFILE_SPECIFIER="" \
+            2>&1 | tee build/xcodebuild.log | grep -E --line-buffered "error:|warning: .*(deprecated|unused)|\*\* ARCHIVE|Build settings|Compiling|Linking" || true
+          # The grep above only filters the live output; the real exit status comes from the log check below.
+          if grep -q "\*\* ARCHIVE SUCCEEDED \*\*" build/xcodebuild.log; then
+            echo "Archive succeeded"
+          else
+            echo "::error::Archive failed"
+            grep -E "error:|fatal error|Undefined symbol|ld: " build/xcodebuild.log | head -100 || true
+            exit 1
+          fi
+
+      - name: Package IPA
+        run: |
+          set -e
+          APP="build/LosslessCam.xcarchive/Products/Applications/LosslessCam.app"
+          test -d "$APP"
+          rm -rf build/Payload build/LosslessCam.ipa
+          mkdir -p build/Payload
+          cp -R "$APP" build/Payload/
+          (cd build && zip -qry LosslessCam.ipa Payload)
+          ls -la build/LosslessCam.ipa
+          unzip -l build/LosslessCam.ipa | head -20
+
+      - name: Upload IPA artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: LosslessCam.ipa
+          path: build/LosslessCam.ipa
+          if-no-files-found: error
+
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: xcodebuild-log
+          path: build/xcodebuild.log
+          if-no-files-found: ignore
+
+      - name: Attach IPA to release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: build/LosslessCam.ipa
+          generate_release_notes: true

@@ -1,0 +1,154 @@
+import Foundation
+
+/// Sidecar metadata stored next to each recording as `<base>.json`.
+struct Recording: Codable, Identifiable, Equatable {
+    struct AudioInfo: Codable, Equatable {
+        var sampleRate: Int
+        var channels: Int
+        var ambisonic: Bool
+        var sourceFormat: String
+        var inexactSamples: Int64
+        var trimmedFrames: Int64
+        var discontinuities: Int
+        var silenceFramesInserted: Int64
+    }
+
+    struct Files: Codable, Equatable {
+        var mkv: String?
+        var hevcReference: String?
+        var hashList: String
+        var intermediate: String?
+        var thumbnail: String?
+    }
+
+    enum Stage2Status: String, Codable { case notNeeded, pending, running, done, failed, cancelled }
+    struct Stage2State: Codable, Equatable {
+        var status: Stage2Status = .notNeeded
+        var progress: Double = 0
+        var error: String?
+        var seconds: Double = 0
+        var intermediateHashMismatches: Int64 = 0
+        var recoveredWithoutTrailer: Bool = false
+    }
+
+    enum VerificationStatus: String, Codable { case notRun, running, pass, fail, error, cancelled }
+    struct VerificationState: Codable, Equatable {
+        var status: VerificationStatus = .notRun
+        var videoStatus: VerificationStatus = .notRun
+        var audioStatus: VerificationStatus = .notRun
+        var framesChecked: Int64 = 0
+        var framesExpected: Int64 = 0
+        var firstMismatchFrame: Int64 = -1
+        var audioFramesChecked: Int64 = 0
+        var audioFirstMismatchFrame: Int64 = -1
+        var crcErrors: Int = 0
+        var sliceCrcChecked: Bool = false
+        var checkedAt: Date?
+        var seconds: Double = 0
+        var message: String?
+    }
+
+    struct TelemetrySummary: Codable, Equatable {
+        var averageFps: Double = 0
+        var peakBufferFill: Double = 0
+        var averageWriteMBps: Double = 0
+        var maxThermalState: Int = 0
+        var memoryWarnings: Int = 0
+    }
+
+    var id: String { baseName }
+    var baseName: String
+    var createdAt: Date
+    var width: Int
+    var height: Int
+    var bitDepth: Int
+    var fullRange: Bool
+    var fps: Int
+    var hdr: Bool
+    var colorDescription: String
+    var pixelFormatFourCC: String
+    var captureMode: String
+    var stage1Codec: String?
+    var preset: String
+    var stabilization: String
+    var frameCount: Int64
+    var droppedFrames: Int64
+    var sourceDroppedFrames: Int64
+    var durationSeconds: Double
+    var audio: AudioInfo?
+    var files: Files
+    var stage2: Stage2State
+    var verification: VerificationState
+    var referencePath: String
+    var telemetry: TelemetrySummary
+    var lowBitsNonZero: Bool
+    var deviceModel: String
+    var appVersion: String
+    var notes: String?
+
+    // Not persisted, filled at scan time.
+    var fileSizeBytes: Int64 = 0
+    var referenceSizeBytes: Int64 = 0
+
+    private enum CodingKeys: String, CodingKey {
+        case baseName, createdAt, width, height, bitDepth, fullRange, fps, hdr, colorDescription, pixelFormatFourCC
+        case captureMode, stage1Codec, preset, stabilization, frameCount, droppedFrames, sourceDroppedFrames
+        case durationSeconds, audio, files, stage2, verification, referencePath, telemetry, lowBitsNonZero
+        case deviceModel, appVersion, notes
+    }
+
+    var resolutionLabel: String { height >= 2160 ? "4K" : (height >= 1080 ? "1080p" : "\(width)×\(height)") }
+    var hasReference: Bool { files.hevcReference != nil }
+    var isReady: Bool { files.mkv != nil && (stage2.status == .done || stage2.status == .notNeeded) }
+
+    static func documentsDirectory() -> URL {
+        FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+    }
+
+    func url(for name: String?) -> URL? {
+        guard let name = name else { return nil }
+        return Recording.documentsDirectory().appendingPathComponent(name)
+    }
+    var mkvURL: URL? { url(for: files.mkv) }
+    var referenceURL: URL? { url(for: files.hevcReference) }
+    var hashListURL: URL { Recording.documentsDirectory().appendingPathComponent(files.hashList) }
+    var intermediateURL: URL? { url(for: files.intermediate) }
+    var sidecarURL: URL { Recording.documentsDirectory().appendingPathComponent(baseName + ".json") }
+
+    func save() throws {
+        let enc = JSONEncoder()
+        enc.outputFormatting = [.prettyPrinted, .sortedKeys]
+        enc.dateEncodingStrategy = .iso8601
+        let data = try enc.encode(self)
+        try data.write(to: sidecarURL, options: .atomic)
+    }
+
+    static func load(from url: URL) throws -> Recording {
+        let dec = JSONDecoder()
+        dec.dateDecodingStrategy = .iso8601
+        var r = try dec.decode(Recording.self, from: Data(contentsOf: url))
+        if let mkv = r.mkvURL, let attrs = try? FileManager.default.attributesOfItem(atPath: mkv.path),
+           let size = attrs[.size] as? NSNumber {
+            r.fileSizeBytes = size.int64Value
+        }
+        if let ref = r.referenceURL, let attrs = try? FileManager.default.attributesOfItem(atPath: ref.path),
+           let size = attrs[.size] as? NSNumber {
+            r.referenceSizeBytes = size.int64Value
+        }
+        return r
+    }
+}
+
+extension Int64 {
+    var byteCountString: String {
+        ByteCountFormatter.string(fromByteCount: self, countStyle: .file)
+    }
+}
+
+extension Double {
+    var durationString: String {
+        let total = Int(self.rounded())
+        let h = total / 3600, m = (total % 3600) / 60, s = total % 60
+        return h > 0 ? String(format: "%d:%02d:%02d", h, m, s) : String(format: "%d:%02d", m, s)
+    }
+}
